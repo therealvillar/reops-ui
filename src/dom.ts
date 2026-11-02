@@ -10,14 +10,16 @@ export function el<K extends keyof HTMLElementTagNameMap>(
 export function button(text: string, action: () => unknown, className = 'button'): HTMLButtonElement {
   const node = el('button', className, text)
   node.type = 'button'
+  let busy = false
   node.addEventListener('click', async () => {
-    if (node.disabled) return
+    if (node.disabled || busy) return
     const result = action()
     if (result instanceof Promise) {
-      node.disabled = true
+      busy = true
+      node.setAttribute('aria-disabled', 'true')
       node.setAttribute('aria-busy', 'true')
       try { await result }
-      finally { node.disabled = false; node.removeAttribute('aria-busy') }
+      finally { busy = false; node.removeAttribute('aria-disabled'); node.removeAttribute('aria-busy') }
     }
   })
   return node
@@ -129,6 +131,8 @@ export function submitForm(form: HTMLFormElement, text: string, action: () => Pr
   form.addEventListener('submit', async event => {
     event.preventDefault()
     if (!form.reportValidity() || submit.disabled) return
+    const hadFocus = document.activeElement === submit
+    const ownerDialog = form.closest('dialog')
     submit.disabled = true
     submit.textContent = 'Saving…'
     form.setAttribute('aria-busy', 'true')
@@ -143,6 +147,13 @@ export function submitForm(form: HTMLFormElement, text: string, action: () => Pr
         feedback.append(document.createTextNode(' '), link)
       }
     }
-    finally { submit.disabled = false; submit.textContent = text; form.removeAttribute('aria-busy') }
+    finally {
+      submit.disabled = false; submit.textContent = text; form.removeAttribute('aria-busy')
+      if (hadFocus && document.activeElement === document.body) {
+        const target = submit.isConnected ? submit : ownerDialog?.open
+          ? [...ownerDialog.querySelectorAll<HTMLButtonElement>('button[type="submit"]')].find(control => control.textContent === text) : undefined
+        target?.focus()
+      }
+    }
   })
 }

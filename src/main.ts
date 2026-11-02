@@ -383,6 +383,7 @@ function renderBoard(records: Property[]): void {
       const stamp = el('span', 'stamp small-stamp', property.creatorStamp); stamp.title = property.creatorName
       foot.append(stamp, el('span', `badge ${property.verificationStatus}`, property.verificationStatus))
       const move = select('moveBin', recordBins(property).map(b => ({ value: b.id, label: b.name })), property.binId); move.disabled = moving.has(property.id)
+      move.dataset.propertyId = property.id
       move.setAttribute('aria-label', `Move ${property.name} to bin`)
       move.addEventListener('change', () => { void changeBin(property.id, move.value) })
       card.append(tags, foot, label(moving.has(property.id) ? 'Moving…' : 'Move to bin', move))
@@ -396,6 +397,7 @@ function renderBoard(records: Property[]): void {
 async function changeBin(id: string, binId: string): Promise<void> {
   const original = properties.find(p => p.id === id)
   if (!original || original.binId === binId || moving.has(id)) return
+  const keyboardMove = document.activeElement instanceof HTMLSelectElement && document.activeElement.dataset.propertyId === id
   if (!recordBins(original).some(b => b.id === binId)) {
     showError(new Error('Choose a bin belonging to this property’s owner. Shared records cannot move into your private bins.'))
     return
@@ -414,7 +416,13 @@ async function changeBin(id: string, binId: string): Promise<void> {
       const detail = await api<{ property: Property }>(`/properties/${encodeURIComponent(id)}`)
       const index = properties.findIndex(p => p.id === id); if (index >= 0) properties[index] = detail.property
     } catch { /* Keep the known record intact if the connection is unavailable. */ }
-  } finally { moving.delete(id); renderContent() }
+  } finally {
+    moving.delete(id); renderContent()
+    if (keyboardMove && document.activeElement === document.body) {
+      (document.querySelector<HTMLSelectElement>(`select[name="moveBin"][data-property-id="${CSS.escape(id)}"]`)
+        ?? document.querySelector<HTMLElement>('[aria-label="Filter by bin"]'))?.focus()
+    }
+  }
 }
 
 function configureView(): void {
@@ -633,7 +641,7 @@ function openNotifications(): void {
       actions.append(button('Open property', async () => {
         try {
           await api(`/notifications/${encodeURIComponent(notification.id)}`, 'PATCH', { read: true })
-          modal.close(); await pollNotifications(); await open(notification.propertyId)
+          modal.close(); await pollNotifications(); announce('Notification marked read.'); await open(notification.propertyId)
         } catch (error) { const errorNode = el('p', 'error-text', errorMessage(error)); errorNode.setAttribute('role', 'alert'); item.append(errorNode) }
       }, 'button small'))
       if (!notification.readAt) actions.append(button('Mark read', async () => {

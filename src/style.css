@@ -15,7 +15,7 @@ button, input, textarea, select { font: inherit }
 button, a, input, select, textarea { -webkit-tap-highlight-color: transparent }
 button, a { touch-action: manipulation }
 button { cursor: pointer }
-button:disabled { cursor: wait; opacity: .58 }
+button:disabled, button[aria-disabled="true"] { cursor: wait; opacity: .58 }
 a { color: var(--teal) }
 h1, h2, h3, p { margin: 0 }
 h1, h2, h3 { font-family: 'Manrope', system-ui, sans-serif }
