@@ -4,11 +4,11 @@ A TypeScript property-record workspace deployed as a Cloudflare Worker with D1 p
 
 ## Architecture and defaults
 
-- **Frontend:** vanilla TypeScript, Vite, and Leaflet. No framework existed in the original workspace. Property data and preferences are not persisted in browser storage.
+- **Frontend:** vanilla TypeScript, Vite, and Leaflet. No framework existed in the original workspace. Property data and preferences are not persisted in browser storage. An empty map starts over New Westminster; populated maps fit their locations.
 - **Backend:** Cloudflare Workers and D1, signed Cloudflare Access identity, server-side address and AI adapters, and a once-per-minute Cron Trigger.
-- **Access:** private records by default, owned by a stable authenticated user ID. Stamps are display identifiers, never authentication credentials. Collaboration across owners is not enabled by default.
+- **Access:** private records by default, owned by a stable authenticated user ID. Owners can explicitly grant viewer/editor access to another registered user's exact ID. Stamps are display identifiers, never authentication credentials. Editors preserve the original creator; viewers cannot mutate records.
 - **Verification:** geocoding and verification are separate. An address remains a draft until a user selects a server-validated candidate. Missing credentials, ambiguous matches, and verification failures must not be treated as verified.
-- **Reminders:** timestamps are stored as UTC instants with an IANA time-zone label. Cron delivers durable in-app notifications without an open tab; the browser polls for delivery. No email/SMS channel is configured.
+- **Reminders:** timestamps are stored as UTC instants with an IANA time-zone label. Enter an explicit UTC offset matching that zone to disambiguate daylight-saving transitions. Cron delivers durable in-app notifications without an open tab; the browser polls for delivery. Editing a delivered reminder does not reschedule it—create a new reminder for another alarm. No email/SMS channel is configured.
 - **AI:** read-only analysis by default. Manual actions and opted-in automatic rules share only selected fields. Results are not executed as instructions and cannot modify records or invoke tools.
 - **Visual reference:** `therealvillar/newwest-calendar` returned 404 during inspection. The interface uses an independent accessible neutral design; screenshots or source files are needed to match that reference.
 
@@ -57,7 +57,7 @@ Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or com
 
 ### Addresses
 
-Enable the provider APIs required by the Worker adapter and configure a restricted server-side key:
+Enable **Google Places API (New)** for autocomplete and **Google Address Validation API** for verification, then configure a restricted server-side key. Exact premise-level validation is required; a geocoded suggestion alone is never verified. Provider coverage varies by country.
 
 ```sh
 npx wrangler secret put ADDRESS_API_KEY
@@ -75,12 +75,14 @@ npx wrangler secret put AI_ENDPOINT
 npx wrangler secret put AI_API_KEY
 ```
 
-The endpoint is deployment-controlled, not record-controlled. It must honor the supplied idempotency key to avoid duplicate upstream work on retries. Provider responses are stored and displayed as untrusted text. Opt-in rules authorize analysis only, not record changes or external actions. Without a configured adapter, AI requests fail clearly rather than producing simulated results.
+The endpoint is deployment-controlled, not record-controlled. It must honor the supplied idempotency key to avoid duplicate upstream work on retries. It receives a JSON analysis request and must return a JSON string in `result` or `output`, or OpenAI-style message content. Provider responses are stored and displayed as untrusted text. Opt-in rules authorize analysis only, not record changes or external actions. Set defaults **before creation** to analyze new records; per-record rules govern subsequent field and reminder events. Without a configured adapter, AI requests fail clearly rather than producing simulated results.
+
+The generic adapter uses bearer authentication and an `Idempotency-Key` header, with `{ "instruction": "...analysis-only...", "fields": ["name"], "record": { "name": "Selected record name" }, "tools": [] }`. A minimal response is `{ "result": "Plain-text analysis" }`. This is a provider-independent service protocol, **not** a drop-in request to a raw OpenAI/Anthropic chat endpoint; deploy a trusted adapter that translates it into your provider's API. Credentials and that provider-specific service are not provisioned by this repository.
 
 ## Scope and operational limits
 
-This repository is an initial implementation, not a claim that external services have been provisioned. Production requires D1, Access, secrets, and deployment configuration. Matching the inaccessible visual reference, shared multi-owner collaboration, additional notification channels, and write-capable AI agents are not included. OpenStreetMap supplies the basemap and has its own attribution, availability, and tile-usage policy; use an appropriate tile service for high traffic.
+This repository is an initial implementation, not a claim that external services have been provisioned. Production requires D1, Access, secrets, and deployment configuration. Matching the inaccessible visual reference, team-wide tenancy/role administration, additional notification channels, and write-capable AI agents are not included. Sharing is an explicit per-record grant, not a global shared workspace. OpenStreetMap supplies the basemap and has its own attribution, availability, and tile-usage policy; use an appropriate tile service for high traffic.
 
-Layer data is Cloudflare-hosted. Only approved D1 data sources and geographic fields should be exposed, never user-provided SQL or arbitrary URLs. Non-property layer features are reference data, not editable property records.
+Layer data is Cloudflare-hosted. The initial approved reference source is D1's `layer_points` table, using `latitude`, `longitude`, and `label`, with `category` and `status` as filterable attributes. The layer dialog accepts an optional JSON import of up to 200 locations. For later bulk imports, use trusted D1 administration with the layer ID and owner ID. The owner ID is a stable Access identity, not an email or stamp. Multiple layers have independent colors and visibility. Adding other table shapes requires a reviewed server-side source adapter; arbitrary SQL and URLs are intentionally disallowed. Non-property layer features are reference data, not editable property records.
 
 Reminder delivery is minute-resolution, not a real-time alarm guarantee. Inspect failed jobs and provider limits before retrying. Local loopback identity is for development only; security acceptance in production includes exercising Access with separate users and verifying that one user cannot read or update another's records.
