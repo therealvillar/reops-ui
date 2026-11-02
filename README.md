@@ -53,6 +53,8 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 
 For a first release on `workers.dev`, obtain the account's existing Workers subdomain from Cloudflare and use the exact `reops-ui.<subdomain>.workers.dev` hostname for both `APP_ORIGIN` and the Access application. Protect only this application, not all Workers on the account. Start with an allow policy for the verified account owner's exact email, not an entire domain or everyone. Workers/D1 deployment permission alone does not grant Access application management permission: an Access API `403 auth.forbidden` requires an authorized administrator to configure Access before deployment. Do not deploy a placeholder with incomplete identity settings or enable development authentication as a substitute.
 
+The initial release target, confirmed by the account's Workers subdomain API, is `https://reops-ui.anthonyrvillar.workers.dev`. It is **not deployed yet**: Access application creation returned HTTP 403 (`1010`, `auth.forbidden`). An administrator must authorize Access management or create the hostname-scoped self-hosted application and provide its team domain and audience. Only then configure the actual D1 ID and production variables, apply remote migrations, deploy, and verify authenticated flows. No production resources were created during release preparation.
+
 Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or committed `.dev.vars`. Back up D1 before schema changes. Configure Cloudflare request-rate limits for the address and AI endpoints according to provider quotas and monitor billing.
 
 ## Integrations requiring credentials
