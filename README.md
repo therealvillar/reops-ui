@@ -59,6 +59,8 @@ The first iteration is deployed at **https://reops-ui.anthonyrvillar.workers.dev
 
 Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Address verification and AI remain optional server-side integrations requiring the credentials documented below.
 
+Automated production-mode integration coverage runs the real Worker bundle against isolated D1 with locally generated RSA keys and mock JWKS, without `DEV_AUTH`. It verifies that valid issuer/audience assertions reach the D1 identity API and a file-backed `ASSETS` service serving repository HTML/CSS, while missing, malformed, wrong-issuer, and wrong-audience assertions reject both asset and API requests. This checks Worker authentication and asset-binding delegation, not a real browser login or Cloudflare's internal static-asset router. The deployed version and bindings, remote migration ledger, exact-owner Access policy, and anonymous production redirects were also checked independently.
+
 Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or committed `.dev.vars`. Back up D1 before schema changes. Configure Cloudflare request-rate limits for the address and AI endpoints according to provider quotas and monitor billing.
 
 ## Integrations requiring credentials
