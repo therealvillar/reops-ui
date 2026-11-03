@@ -12,13 +12,13 @@
   "d1_databases": [{
     "binding": "DB",
     "database_name": "reops",
-    "database_id": "00000000-0000-0000-0000-000000000000",
+    "database_id": "7a1cc07b-395b-4bf2-8331-ddcd740e183d",
     "migrations_dir": "migrations"
   }],
   "triggers": { "crons": ["* * * * *"] },
   "vars": {
-    "APP_ORIGIN": "https://reops.example.com",
-    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
-    "ACCESS_AUD": "configure-access-application-audience"
+    "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": ""
   }
 }

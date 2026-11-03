@@ -43,7 +43,7 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 ## Cloudflare deployment
 
 1. Authenticate Wrangler: `npx wrangler login`.
-2. Create D1: `npx wrangler d1 create reops`. Replace the zero `database_id` in `wrangler.jsonc` with the returned ID.
+2. Use the existing release D1 database configured in `wrangler.jsonc`. For a separate account, create a new database with `npx wrangler d1 create reops` and replace `database_id` with its returned ID; do not apply migrations to an unrelated database.
 3. Set `APP_ORIGIN` to the exact HTTPS origin where this app will be served.
 4. Create a Cloudflare Zero Trust **Access self-hosted application** covering the entire application hostname, with an explicit allow policy. Set `ACCESS_TEAM_DOMAIN` (hostname only, e.g. `team.cloudflareaccess.com`) and `ACCESS_AUD` to that application's audience.
 5. Do **not** set `DEV_AUTH` on the deployed Worker. The API must fail closed when production identity configuration is missing.
@@ -53,7 +53,9 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 
 For a first release on `workers.dev`, obtain the account's existing Workers subdomain from Cloudflare and use the exact `reops-ui.<subdomain>.workers.dev` hostname for both `APP_ORIGIN` and the Access application. Protect only this application, not all Workers on the account. Start with an allow policy for the verified account owner's exact email, not an entire domain or everyone. Workers/D1 deployment permission alone does not grant Access application management permission: an Access API `403 auth.forbidden` requires an authorized administrator to configure Access before deployment. Do not deploy a placeholder with incomplete identity settings or enable development authentication as a substitute.
 
-The initial release target, confirmed by the account's Workers subdomain API, is `https://reops-ui.anthonyrvillar.workers.dev`. It is **not deployed yet**: Access application creation returned HTTP 403 (`1010`, `auth.forbidden`). An administrator must authorize Access management or create the hostname-scoped self-hosted application and provide its team domain and audience. Only then configure the actual D1 ID and production variables, apply remote migrations, deploy, and verify authenticated flows. No production resources were created during release preparation.
+The initial release target, confirmed by the account's Workers subdomain API, is `https://reops-ui.anthonyrvillar.workers.dev`. Release preparation created only the app's `reops` D1 database (`7a1cc07b-395b-4bf2-8331-ddcd740e183d`) in the existing Cloudflare account and applied all four repository migrations. Remote schema inspection confirmed the migration ledger and application tables, no foreign-key violations, and zero property records. The actual database ID and `APP_ORIGIN` are configured; unrelated databases were not changed.
+
+The application is **not deployed yet**: Access application creation returned HTTP 403 (`1010`, `auth.forbidden`). `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are intentionally empty, so production authentication fails closed. An administrator must authorize Access management or create the hostname-scoped self-hosted application with an exact-owner allow policy and provide its team domain and audience. Set those valid values before deployment, then verify authenticated flows. No Worker, paid upgrade, or substitute deployment was created.
 
 Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or committed `.dev.vars`. Back up D1 before schema changes. Configure Cloudflare request-rate limits for the address and AI endpoints according to provider quotas and monitor billing.
 
