@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "reops-ui",
+  "preview_urls": false,
   "main": "worker/index.ts",
   "compatibility_date": "2026-11-02",
   "assets": {
@@ -18,7 +19,7 @@
   "triggers": { "crons": ["* * * * *"] },
   "vars": {
     "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
-    "ACCESS_TEAM_DOMAIN": "",
-    "ACCESS_AUD": ""
+    "ACCESS_TEAM_DOMAIN": "anthonyvillar.cloudflareaccess.com",
+    "ACCESS_AUD": "997b58952c9e2460e1ca50a4b39b5fc5bb979653b7982448c9e79b3fe71a8919"
   }
 }
