@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Layer, LayerFeature, Property, SavedView } from '../shared/types'
-import { attributeNamePattern, compareValues, defaultView, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, matchesAttribute, moveProperty, newPropertyAIRule, parseAttributes, propertyBinChoices, propertyLayerVisible, validateReminderInstant } from '../src/utils'
+import { attributeNamePattern, compareValues, defaultView, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, matchesAttribute, moveProperty, newPropertyAIRule, parseAttributes, propertyBinChoices, propertyLayerVisible, validateReminderInstant, verificationStatusLabel } from '../src/utils'
 
 const property = (overrides: Partial<Property> = {}): Property => ({
   id: 'p1', name: 'Alpha', enteredAddress: '123 Main Street', normalizedAddress: null,
@@ -22,6 +22,13 @@ test('fallback view matches canonical server defaults and property map toggle is
   assert.equal(propertyLayerVisible(defaultView), true)
   assert.equal(propertyLayerVisible({ layers: [] }), false)
   assert.equal(propertyLayerVisible({ layers: ['context'] }), false)
+})
+
+test('verified address status is presented as geocoded without changing other statuses', () => {
+  assert.equal(verificationStatusLabel('verified'), 'Geocoded')
+  assert.equal(verificationStatusLabel('unverified'), 'unverified')
+  assert.equal(verificationStatusLabel('ambiguous'), 'ambiguous')
+  assert.equal(fieldLabels.normalizedAddress, 'Geocoded address')
 })
 
 test('nullable new-property AI defaults remain disabled until explicit precreation opt-in', () => {

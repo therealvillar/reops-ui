@@ -16,7 +16,7 @@ export function newPropertyAIRule(rule: AIRule | null): AIRule {
 }
 
 export const fieldLabels: Record<string, string> = {
-  name: 'Property', enteredAddress: 'Address', normalizedAddress: 'Verified address',
+  name: 'Property', enteredAddress: 'Address', normalizedAddress: 'Geocoded address',
   binId: 'Bin', tags: 'Tags', verificationStatus: 'Address status', creatorStamp: 'Creator stamp',
   creatorName: 'Created by', createdAt: 'Created', updatedAt: 'Updated', version: 'Version',
   latitude: 'Latitude', longitude: 'Longitude',
@@ -31,6 +31,10 @@ export function displayValue(value: unknown): string {
   if (Array.isArray(value)) return value.join(', ')
   if (typeof value === 'boolean') return value ? 'Yes' : 'No'
   return String(value)
+}
+
+export function verificationStatusLabel(status: Property['verificationStatus']): string {
+  return status === 'verified' ? 'Geocoded' : status
 }
 
 // Comparisons keep numeric attributes numeric; explicit operators enable range filters.

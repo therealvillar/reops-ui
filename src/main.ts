@@ -2,7 +2,7 @@ import type { Bin, Layer, LayerFeature, Notification, Property, SavedView, User 
 import { announce, api, ApiError, button, dialog, el, errorMessage, input, label, select, submitForm } from './dom'
 import { createProperty, openProperty } from './detail'
 import { PropertyMap } from './map'
-import { defaultView, displayValue, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, moveProperty, propertyBinChoices, propertyLayerVisible } from './utils'
+import { defaultView, displayValue, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, moveProperty, propertyBinChoices, propertyLayerVisible, verificationStatusLabel } from './utils'
 import './style.css'
 
 type Mode = 'map' | 'table' | 'board'
@@ -251,20 +251,20 @@ function renderContent(): void {
   const filtered = filterProperties(properties, view)
   const verified = properties.filter(p => p.verificationStatus === 'verified').length
   const ungeocoded = properties.filter(p => !isMappable(p)).length
-  const nextMilestone = properties.length === 0 ? 'Add your first property' : verified === 0 ? 'Confirm a property address' : 'Keep the next step in sight'
+  const nextMilestone = properties.length === 0 ? 'Add your first property' : verified === 0 ? 'Select an address location' : 'Keep the next step in sight'
   welcome.replaceChildren()
   const welcomeText = el('div')
   welcomeText.append(el('p', 'eyebrow', 'YOUR FIELD GUIDE'), el('h2', '', properties.length ? 'A little progress, a little perspective.' : `Welcome, ${user.name.split(' ')[0]}. Let’s make room for progress.`),
-    el('p', '', properties.length ? 'A verified address and a useful note beat a hundred busy edits. Open a dossier to capture both.' : 'Start with one property. Verify its address, leave a field note, and plan what comes next.'))
+    el('p', '', properties.length ? 'A geocoded address and a useful note beat a hundred busy edits. Open a dossier to capture both.' : 'Start with one property. Select its address location, leave a field note, and plan what comes next.'))
   const welcomeSteps = el('div', 'welcome-steps')
   welcomeSteps.append(el('span', `step ${properties.length ? 'done' : ''}`, `${properties.length ? '✓' : '1'} Record started`),
-    el('span', `step ${verified ? 'done' : ''}`, `${verified ? '✓' : '2'} Address confirmed`),
+    el('span', `step ${verified ? 'done' : ''}`, `${verified ? '✓' : '2'} Location selected`),
     button(nextMilestone + ' ↗', properties.length ? () => { void open(properties.find(p => p.verificationStatus !== 'verified')?.id ?? properties[0].id) } : add, 'text-button'))
   welcome.append(welcomeText, welcomeSteps)
   metrics.replaceChildren()
   for (const [name, value, hint] of [
     ['Properties', properties.length, 'Places in your workspace'],
-    ['Verified addresses', verified, 'Ready for the map'],
+    ['Geocoded addresses', verified, 'Ready for the map'],
     ['Unlocated drafts', ungeocoded, 'Excluded from the map'],
     ['Pipeline bins', bins.length, 'Your stages, your way'],
   ]) {
@@ -288,7 +288,7 @@ function renderContent(): void {
         ? 'Enable Properties in the map legend to show these locations, or choose a reference layer.'
         : hasReferenceLocations
         ? 'Reference locations are hidden by the active filters. Clear filters or enable a compatible layer. Unlocated drafts remain available in Table and Board.'
-        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Confirm an address in the dossier to add a map location.' : 'Add a property or clear filters to start exploring.'), button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
+        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Select an address location in the dossier to add a map location.' : 'Add a property or clear filters to start exploring.'), button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
       content.append(empty)
     }
   } else {
@@ -337,7 +337,7 @@ function renderTable(records: Property[]): void {
       if (field === 'name') {
         const openName = button(property.name, () => open(property.id), 'property-name'); openName.dataset.propertyId = property.id; td.append(openName)
       }
-      else if (field === 'verificationStatus') td.append(el('span', `badge ${property.verificationStatus}`, property.verificationStatus))
+      else if (field === 'verificationStatus') td.append(el('span', `badge ${property.verificationStatus}`, verificationStatusLabel(property.verificationStatus)))
       else if (field === 'binId') {
         const chip = el('span', 'bin-chip', displayValue(value)); chip.style.setProperty('--bin-color', matchingBin?.color ?? '#197e76'); td.append(chip)
       } else if (field === 'tags') for (const tag of property.tags) td.append(el('span', 'tag', tag))
@@ -381,7 +381,7 @@ function renderBoard(records: Property[]): void {
       const tags = el('div', 'tags'); property.tags.forEach(tag => tags.append(el('span', 'tag', tag)))
       const foot = el('div', 'card-foot')
       const stamp = el('span', 'stamp small-stamp', property.creatorStamp); stamp.title = property.creatorName
-      foot.append(stamp, el('span', `badge ${property.verificationStatus}`, property.verificationStatus))
+      foot.append(stamp, el('span', `badge ${property.verificationStatus}`, verificationStatusLabel(property.verificationStatus)))
       const move = select('moveBin', recordBins(property).map(b => ({ value: b.id, label: b.name })), property.binId); move.disabled = moving.has(property.id)
       move.dataset.propertyId = property.id
       move.setAttribute('aria-label', `Move ${property.name} to bin`)
