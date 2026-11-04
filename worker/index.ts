@@ -1,6 +1,7 @@
 import type { AIRule, Bin, Detail, Layer, LayerFeature, Note, Property, Reminder, User } from '../shared/types'
 import { authenticate, protectOrigin } from './auth'
 import { addressSelection, searchAddress } from './address'
+import { propertyArea } from './area'
 import { enqueueManual, jobModel, processJobs, requireAI, scheduledWork, type JobRow } from './ai'
 import { aiFields, assert, attributes, color, DEFAULT_VIEW, dueAt, HttpError, keys, object, rule, savedView, strings, text, timeZone } from './validation'
 
@@ -11,8 +12,9 @@ export interface Env {
   ACCESS_AUD?: string
   APP_ORIGIN?: string
   DEV_AUTH?: string
-  ADDRESS_API_KEY?: string
   ADDRESS_TOKEN_SECRET?: string
+  BUCKS_PARCELS_ENABLED?: string
+  DELAWARE_ZONING_ENABLED?: string
   AI_ENDPOINT?: string
   AI_API_KEY?: string
 }
@@ -122,6 +124,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     }
     if (id) {
       const p = await accessibleProperty(env, user, id, !['GET', 'HEAD'].includes(method))
+      if (sub === 'area' && parts.length === 3 && method === 'GET') return response(await propertyArea(p, url.searchParams.get('county'), env))
       if (sub === 'bins' && !subId && method === 'GET') return response((await env.DB.prepare('SELECT id,name,color,position FROM bins WHERE owner_id=? ORDER BY position,id').bind(p.creatorId).all<Bin>()).results)
       if (sub === 'members' && !action) {
         assert(p.creatorId === user.id, 'Only the property owner can manage access', 403)

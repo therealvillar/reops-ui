@@ -4,7 +4,6 @@ APP_ORIGIN=http://127.0.0.1:5173
 ACCESS_TEAM_DOMAIN=
 ACCESS_AUD=
 # Optional integrations. Set real secrets locally or with wrangler secret put.
-ADDRESS_API_KEY=
 ADDRESS_TOKEN_SECRET=
 AI_ENDPOINT=
 AI_API_KEY=
