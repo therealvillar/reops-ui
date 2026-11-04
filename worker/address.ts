@@ -53,7 +53,8 @@ export async function searchAddress(env: Env, user: User, query: string): Promis
       const url = new URL('https://geocoding.geo.census.gov/geocoder/locations/onelineaddress')
       url.search = new URLSearchParams({ address: query, benchmark, format: 'json' }).toString()
       const response = await fetch(url, {
-        method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10000),
+        // Workers do not support redirect:"error"; manual plus the status check rejects redirects.
+        method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(10000),
       })
       if (!response.ok) throw new Error('Unavailable')
       const body = await censusResponse(response)

@@ -83,7 +83,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   candidates.id = `candidates-${crypto.randomUUID()}`
   candidates.setAttribute('role', 'listbox')
   address.setAttribute('aria-controls', candidates.id)
-  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Confirm an address suggestion when available. Drafts can be saved without verification.')
+  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US address, city, state, and ZIP, then select a Census match. Drafts can be saved without a location.')
   status.setAttribute('role', 'status')
   let token: string | undefined
   let selectedAddress: string | undefined
@@ -140,7 +140,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
     label('Pipeline bin', bin), label('Tags', tags, 'Separate tags with commas.'), attrs.node)
   submitForm(form, property ? 'Save property' : 'Create property', async () => {
     const body: Record<string, unknown> = {
-      name: name.value.trim(), enteredAddress: token && selectedAddress === address.value ? address.value : address.value.trim(), binId: bin.value,
+      name: name.value.trim(), enteredAddress: address.value, binId: bin.value,
       tags: [...new Set(tags.value.split(',').map(t => t.trim()).filter(Boolean))], attributes: attrs.value(),
     }
     if (property) body.version = property.version
@@ -227,11 +227,11 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     }, 'text-button'))
     summary.append(title, stamp(p.creatorName, p.creatorStamp))
     const verify = el('div', `verification ${p.verificationStatus}`)
-    verify.append(el('strong', '', `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address verification result available.'))
+    verify.append(el('strong', '', p.verificationStatus === 'verified' ? 'Address location selected' : `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address location result available.'))
     if (p.normalizedAddress) verify.append(el('p', '', p.normalizedAddress))
     const progress = el('div', 'progress-card')
     const milestones = [Boolean(p.name && p.enteredAddress), p.verificationStatus === 'verified', detail.notes.length > 0, detail.reminders.some(r => ['scheduled', 'delivered', 'completed'].includes(r.state))]
-    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · address verified · insight noted · next step planned'))
+    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · location selected · insight noted · next step planned'))
     const bar = el('progress'); bar.max = 4; bar.value = milestones.filter(Boolean).length; bar.setAttribute('aria-label', 'Useful property completion')
     progress.append(bar)
     const edit = section('Property details', 'Your creator stamp stays with this record, wherever it goes.')

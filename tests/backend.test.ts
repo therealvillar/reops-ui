@@ -37,6 +37,7 @@ async function upstream(request: Request): Promise<Response> {
     const query = url.searchParams.get('address')!
     censusCalls.push(query)
     if (query === 'Provider non-OK') return new Response('unavailable', { status: 503 })
+    if (query === 'Provider redirect') return new Response(null, { status: 302, headers: { Location: 'https://unexpected.example/private' } })
     if (query === 'Malformed JSON') return new Response('{')
     if (query === 'Malformed result') return Response.json({ result: { addressMatches: {} } })
     if (query === 'Null result') return Response.json(null)
@@ -347,7 +348,7 @@ test('Census cache reuses conservatively normalized queries and canonical single
 })
 
 test('Census no/invalid matches and provider failures never become successful cache entries; drafts remain available', async () => {
-  for (const query of ['No matches', 'Invalid matches', 'Provider non-OK', 'Malformed JSON', 'Malformed result', 'Null result']) {
+  for (const query of ['No matches', 'Invalid matches', 'Provider non-OK', 'Provider redirect', 'Malformed JSON', 'Malformed result', 'Null result']) {
     const beforeCalls = censusCalls.length
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await api<{ candidates?: AddressCandidate[]; message?: string }>('addresses/search', 'POST', { query })
@@ -375,7 +376,7 @@ test('Census request timeout and network errors are recoverable and do not cache
     for (const failure of [new DOMException('Timed out', 'TimeoutError'), new TypeError('Network unavailable')]) {
       globalThis.fetch = (async (_input, options) => {
         assert.equal(options?.method, 'GET')
-        assert.equal(options?.redirect, 'error')
+        assert.equal(options?.redirect, 'manual')
         assert.ok(options?.signal instanceof AbortSignal)
         throw failure
       }) as typeof fetch
