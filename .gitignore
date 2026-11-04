@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .wrangler/
+.smoke-runtime/
 .dev.vars
 .env
 *.local

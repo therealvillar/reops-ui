@@ -43,13 +43,23 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 ## Cloudflare deployment
 
 1. Authenticate Wrangler: `npx wrangler login`.
-2. Create D1: `npx wrangler d1 create reops`. Replace the zero `database_id` in `wrangler.jsonc` with the returned ID.
+2. Use the existing release D1 database configured in `wrangler.jsonc`. For a separate account, create a new database with `npx wrangler d1 create reops` and replace `database_id` with its returned ID; do not apply migrations to an unrelated database.
 3. Set `APP_ORIGIN` to the exact HTTPS origin where this app will be served.
 4. Create a Cloudflare Zero Trust **Access self-hosted application** covering the entire application hostname, with an explicit allow policy. Set `ACCESS_TEAM_DOMAIN` (hostname only, e.g. `team.cloudflareaccess.com`) and `ACCESS_AUD` to that application's audience.
 5. Do **not** set `DEV_AUTH` on the deployed Worker. The API must fail closed when production identity configuration is missing.
 6. Apply migrations: `npm run db:remote`.
 7. Configure optional server-side secrets below; then `npm run deploy`.
 8. Check the deployed Access login, create an unverified draft, verify an address if configured, move a card, and schedule a near-term reminder. Check Worker logs and Cron events for delivery. Cron changes can take several minutes to propagate.
+
+For a first release on `workers.dev`, obtain the account's existing Workers subdomain from Cloudflare and use the exact `reops-ui.<subdomain>.workers.dev` hostname for both `APP_ORIGIN` and the Access application. Protect only this application, not all Workers on the account. Start with an allow policy for the verified account owner's exact email, not an entire domain or everyone. Workers/D1 deployment permission alone does not grant Access application management permission: an Access API `403 auth.forbidden` requires an authorized administrator to configure Access before deployment. Do not deploy a placeholder with incomplete identity settings or enable development authentication as a substitute.
+
+The initial release target, confirmed by the account's Workers subdomain API, is `https://reops-ui.anthonyrvillar.workers.dev`. Release preparation created only the app's `reops` D1 database (`7a1cc07b-395b-4bf2-8331-ddcd740e183d`) in the existing Cloudflare account and applied all four repository migrations. Remote schema inspection confirmed the migration ledger and application tables, no foreign-key violations, and zero property records. The actual database ID and `APP_ORIGIN` are configured; unrelated databases were not changed.
+
+The first iteration is deployed at **https://reops-ui.anthonyrvillar.workers.dev** behind hostname-scoped Cloudflare Access. The user-authorized management profile resolved the earlier Access permission blocker. The application allows only the verified account owner's exact email; its actual team domain and audience are configured. Anonymous requests to the root, HTML, JavaScript asset, and API redirect to Access login. Preview URLs are disabled so alternate version hostnames cannot serve an unprotected copy. Production `DEV_AUTH` is absent, the existing D1 database is preserved, and no paid upgrade or unrelated Access policy change was made.
+
+Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Address verification and AI remain optional server-side integrations requiring the credentials documented below.
+
+Automated production-mode integration coverage runs the real Worker bundle against isolated D1 with locally generated RSA keys and mock JWKS, without `DEV_AUTH`. It verifies that valid issuer/audience assertions reach the D1 identity API and a file-backed `ASSETS` service serving repository HTML/CSS, while missing, malformed, wrong-issuer, and wrong-audience assertions reject both asset and API requests. This checks Worker authentication and asset-binding delegation, not a real browser login or Cloudflare's internal static-asset router. The deployed version and bindings, remote migration ledger, exact-owner Access policy, and anonymous production redirects were also checked independently.
 
 Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or committed `.dev.vars`. Back up D1 before schema changes. Configure Cloudflare request-rate limits for the address and AI endpoints according to provider quotas and monitor billing.
 

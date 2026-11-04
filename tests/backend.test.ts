@@ -92,8 +92,20 @@ before(async () => {
   tokens = { alice: await token('alice'), bob: await token('bob') }
   const bundle = await build({ entryPoints: ['worker/index.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false })
   runtimeDirectory = await mkdtemp(join(tmpdir(), 'reops-backend-'))
+  const assetFiles = new Map([
+    ['/', await readFile(new URL('../index.html', import.meta.url), 'utf8')],
+    ['/app.css', await readFile(new URL('../src/style.css', import.meta.url), 'utf8')],
+  ])
   mf = new Miniflare({ ...convertV4MiniflareOptions({
     modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-11-02', d1Databases: ['DB'],
+    serviceBindings: { ASSETS: (request: Request) => {
+      const path = new URL(request.url).pathname
+      const content = assetFiles.get(path)
+      return new Response(content ?? 'Not found', {
+        status: content === undefined ? 404 : 200,
+        headers: { 'Content-Type': path === '/app.css' ? 'text/css' : 'text/html' },
+      })
+    } },
     bindings: { ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin,
       ADDRESS_API_KEY: 'test-address-key', ADDRESS_TOKEN_SECRET: signingSecret, AI_ENDPOINT: 'https://ai.example.com/analyze', AI_API_KEY: 'test-ai-key' },
     outboundService: upstream as never,
@@ -131,6 +143,35 @@ test('Access verifies JWTs and isolates owners; cross-origin and forged headers 
   assert.deepEqual((await api<Property[]>('properties', 'GET', undefined, 'bob')).data, [])
   const bobBin = (await api<Bin[]>('bins', 'GET', undefined, 'bob')).data[0]
   assert.equal((await api('properties', 'POST', { name: 'No', enteredAddress: '', binId: bobBin.id })).status, 404)
+})
+
+test('production-mode Access authenticates real Worker assets and D1 API without development auth', async () => {
+  const validHeaders = { 'Cf-Access-Jwt-Assertion': tokens.alice }
+  for (const [path, file] of [['/', '../index.html'], ['/app.css', '../src/style.css']]) {
+    const result = await mf.dispatchFetch(`${origin}${path}`, { headers: validHeaders })
+    assert.equal(result.status, 200)
+    assert.equal(await result.text(), await readFile(new URL(file, import.meta.url), 'utf8'))
+    assert.equal(result.headers.get('cache-control'), 'no-store')
+  }
+  const identity = await api<User>('me')
+  assert.equal(identity.status, 200)
+  assert.equal(identity.data.id, `${issuer}|alice`)
+  assert.ok(await db.prepare('SELECT id FROM users WHERE id=?').bind(identity.data.id).first())
+
+  const wrongIssuer = await new SignJWT({ email: 'alice@example.com' })
+    .setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer('https://wrong-team.cloudflareaccess.com')
+    .setAudience('test-audience').setSubject('alice').setIssuedAt().setExpirationTime('1h').sign(privateKey)
+  const wrongAudience = await new SignJWT({ email: 'alice@example.com' })
+    .setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).setIssuer(issuer)
+    .setAudience('wrong-audience').setSubject('alice').setIssuedAt().setExpirationTime('1h').sign(privateKey)
+  for (const path of ['/', '/app.css', '/api/me']) {
+    for (const assertion of [undefined, 'invalid-token', wrongIssuer, wrongAudience]) {
+      const result = await mf.dispatchFetch(`${origin}${path}`, {
+        headers: assertion === undefined ? {} : { 'Cf-Access-Jwt-Assertion': assertion },
+      })
+      assert.equal(result.status, 401, `${path}: ${assertion === undefined ? 'missing' : 'invalid'} assertion`)
+    }
+  }
 })
 
 test('request byte limits are enforced before JSON decoding', async () => {
