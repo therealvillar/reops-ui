@@ -32,7 +32,7 @@ const references: Record<AreaCounty, { name: string; url: string }[]> = {
 }
 
 async function publicJSON(url: URL): Promise<Record<string, unknown>> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'error' })
+  const response = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'manual' })
   if (!response.ok || !response.body) throw new Error('Public service unavailable')
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []

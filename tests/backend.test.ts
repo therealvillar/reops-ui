@@ -8,7 +8,7 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
 import type { Env } from '../worker/index'
-import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, Reminder, SavedView, User } from '../shared/types'
+import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, PropertyArea, Reminder, SavedView, User } from '../shared/types'
 
 let mf: Miniflare, db: D1Database, env: Env
 let runtimeDirectory: string | undefined
@@ -21,6 +21,7 @@ const origin = 'https://app.example.com'
 const issuer = 'https://test-team.cloudflareaccess.com'
 const signingSecret = 'test-only-address-signing-secret-32-characters'
 const censusCalls: string[] = []
+let cartoCalls = 0
 
 async function upstream(request: Request): Promise<Response> {
   const url = new URL(request.url)
@@ -56,6 +57,13 @@ async function upstream(request: Request): Promise<Response> {
       { matchedAddress: '123 Main Street, Other City', coordinates: { x: -74.3, y: 41.2 } },
       { matchedAddress: 'Invalid partial match', coordinates: { x: -74.3, y: 95 } },
     ] } })
+  }
+  if (url.hostname === 'phl.carto.com') {
+    assert.equal(request.method, 'GET')
+    assert.equal(url.pathname, '/api/v2/sql')
+    assert.match(url.searchParams.get('q')!, /ST_DWithin.*LIMIT 25$/)
+    cartoCalls++
+    return Response.json({ rows: [] })
   }
   if (url.hostname === 'ai.example.com') {
     assert.equal(request.headers.get('authorization'), ['Bearer', 'test-ai-key'].join(' '))
@@ -323,6 +331,12 @@ test('Census cache reuses conservatively normalized queries and canonical single
   const selected = await createProperty('Normalized cache hit', { enteredAddress: query, addressToken: cached.data.candidates[0].token })
   assert.equal(selected.enteredAddress, query)
   assert.equal(selected.verificationStatus, 'verified')
+  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, name: 'Unrelated edit preserves selected whitespace query' })
+  assert.equal(edited.status, 200)
+  assert.equal(edited.data.enteredAddress, query)
+  assert.equal(edited.data.verificationStatus, 'verified')
+  assert.equal(edited.data.latitude, selected.latitude)
+  assert.equal(edited.data.longitude, selected.longitude)
   assert.equal((await api('properties', 'POST', { name: 'Cache token mismatch', enteredAddress: '123 Main', binId: bin.id, addressToken: cached.data.candidates[0].token })).status, 400)
   const bobCached = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query }, 'bob')
   assert.equal(censusCalls.length, count)
@@ -428,7 +442,8 @@ test('address selection rejects invalid coordinates and wrong token claims even 
   }
 })
 
-test('area lookup requires property access, selected coordinates, and a supported county', async () => {
+test('area lookup enforces property access and inputs and fetches public data in the production Worker runtime', async () => {
+  const beforeCalls = cartoCalls
   const draft = await createProperty('Area lookup draft')
   assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
   assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`)).status, 400)
@@ -436,6 +451,17 @@ test('area lookup requires property access, selected coordinates, and a supporte
   const located = await createProperty('Area lookup selected Census match', { addressToken: search.data.candidates[0].token })
   assert.equal((await api(`properties/${located.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
   assert.equal((await api(`properties/${located.id}/area?county=unsupported`)).status, 400)
+  assert.equal(cartoCalls, beforeCalls)
+  const area = await api<PropertyArea>(`properties/${located.id}/area?county=philadelphia`)
+  assert.equal(area.status, 200)
+  assert.equal(area.data.county, 'philadelphia')
+  assert.equal(cartoCalls, beforeCalls + 7)
+  assert.equal(area.data.sources.filter(source => source.status === 'ok').length, 7)
+  assert.equal(area.data.sources.some(source => source.status === 'unavailable'), false)
+  for (const source of area.data.sources.filter(source => source.status === 'ok')) {
+    assert.deepEqual(source.records, [])
+    assert.equal(source.limited, false)
+  }
 })
 
 test('safe owner-scoped layer configuration and saved preferences persist server-side', async () => {

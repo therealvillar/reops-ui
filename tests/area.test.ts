@@ -22,7 +22,7 @@ test('Philadelphia requests fixed spatial queries with bounded records and no tr
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input)); requests.push(url)
     assert.equal(url.hostname, 'phl.carto.com')
-    assert.equal(init?.redirect, 'error')
+    assert.equal(init?.redirect, 'manual')
     const sql = url.searchParams.get('q')!
     assert.match(sql, /ST_DWithin/)
     assert.match(sql, /-75.16, 39.95/)
@@ -68,6 +68,15 @@ test('oversized public responses are cancelled and reported unavailable', async 
   }))
   const area = await propertyArea(property, 'philadelphia')
   assert.equal(cancelled, 7)
+  assert.equal(area.sources.filter(source => source.status === 'unavailable').length, 7)
+})
+
+test('public-service redirects are rejected rather than followed', async () => {
+  globalThis.fetch = async (_, init) => {
+    assert.equal(init?.redirect, 'manual')
+    return new Response(null, { status: 302, headers: { Location: 'https://unapproved.example/' } })
+  }
+  const area = await propertyArea(property, 'philadelphia')
   assert.equal(area.sources.filter(source => source.status === 'unavailable').length, 7)
 })
 
