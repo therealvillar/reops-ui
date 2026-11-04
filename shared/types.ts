@@ -54,6 +54,21 @@ export interface AddressCandidate {
   token: string; label: string; latitude: number | null; longitude: number | null
   verified: boolean; message: string
 }
+export type AreaCounty = 'philadelphia' | 'montgomery' | 'bucks' | 'delaware'
+export interface AreaSource {
+  name: string
+  url: string
+  status: 'ok' | 'unavailable' | 'reference'
+  message: string
+  records: Record<string, string | number | boolean | null>[]
+  limited: boolean
+}
+export interface PropertyArea {
+  county: AreaCounty
+  radiusMeters: number
+  fetchedAt: string
+  sources: AreaSource[]
+}
 export interface Layer {
   id: string; name: string; color: string; source: string
   latitudeField: string; longitudeField: string; labelField: string

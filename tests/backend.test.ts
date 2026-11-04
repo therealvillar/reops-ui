@@ -1,14 +1,14 @@
 import { after, before, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { build } from 'esbuild'
 import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
+import { addressSelection, searchAddress } from '../worker/address'
 import type { Env } from '../worker/index'
-import type { AIJob, Bin, Detail, Layer, Notification, Property, Reminder, SavedView, User } from '../shared/types'
+import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, PropertyArea, Reminder, SavedView, User } from '../shared/types'
 
 let mf: Miniflare, db: D1Database, env: Env
 let runtimeDirectory: string | undefined
@@ -20,6 +20,8 @@ let aiOversized = false, aiBodyCancelled = false, aiBodyChunks = 0
 const origin = 'https://app.example.com'
 const issuer = 'https://test-team.cloudflareaccess.com'
 const signingSecret = 'test-only-address-signing-secret-32-characters'
+const censusCalls: string[] = []
+let cartoCalls = 0
 
 async function upstream(request: Request): Promise<Response> {
   const url = new URL(request.url)
@@ -27,20 +29,41 @@ async function upstream(request: Request): Promise<Response> {
     const publicKey = await crypto.subtle.exportKey('jwk', await crypto.subtle.importKey('jwk', publicJwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['verify']))
     return Response.json({ keys: [{ ...publicKey, kid: 'test-key', alg: 'RS256', use: 'sig' }] })
   }
-  if (url.hostname === 'places.googleapis.com') return Response.json({
-    suggestions: [
-      { placePrediction: { text: { text: '123 Main St, Springfield' } } },
-      { placePrediction: { text: { text: '123 Main Street, Ambiguous City' } } },
-    ],
-  })
-  if (url.hostname === 'addressvalidation.googleapis.com') {
-    const input = await request.json() as { address: { addressLines: string[] } }
-    const ambiguous = input.address.addressLines[0].includes('Ambiguous')
-    return Response.json({ result: {
-      verdict: { addressComplete: !ambiguous, hasUnconfirmedComponents: ambiguous, validationGranularity: 'PREMISE', geocodeGranularity: 'PREMISE' },
-      address: { formattedAddress: input.address.addressLines[0] },
-      geocode: { location: { latitude: 40.1, longitude: -73.2 } },
-    } })
+  if (url.hostname === 'geocoding.geo.census.gov') {
+    assert.equal(request.method, 'GET')
+    assert.equal(url.pathname, '/geocoder/locations/onelineaddress')
+    assert.equal(url.searchParams.get('benchmark'), 'Public_AR_Current')
+    assert.equal(url.searchParams.get('format'), 'json')
+    assert.deepEqual([...url.searchParams.keys()].sort(), ['address', 'benchmark', 'format'])
+    const query = url.searchParams.get('address')!
+    censusCalls.push(query)
+    if (query === 'Provider non-OK') return new Response('unavailable', { status: 503 })
+    if (query === 'Provider redirect') return new Response(null, { status: 302, headers: { Location: 'https://unexpected.example/private' } })
+    if (query === 'Malformed JSON') return new Response('{')
+    if (query === 'Malformed result') return Response.json({ result: { addressMatches: {} } })
+    if (query === 'Null result') return Response.json(null)
+    if (query === 'No matches') return Response.json({ result: { addressMatches: [] } })
+    if (query === 'Invalid matches') return Response.json({ result: { addressMatches: [
+      null, {}, { matchedAddress: '', coordinates: { x: -73.2, y: 40.1 } },
+      { matchedAddress: 'Out of bounds', coordinates: { x: -181, y: 91 } },
+      { matchedAddress: 'String coordinates', coordinates: { x: '-73.2', y: '40.1' } },
+      { matchedAddress: 'Missing coordinate', coordinates: { x: -73.2 } },
+    ] } })
+    if (query === 'Single match') return Response.json({ result: { addressMatches: [
+      { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 } },
+    ] } })
+    return Response.json({ result: { addressMatches: [
+      { matchedAddress: '123 Main St, Springfield', coordinates: { x: -73.2, y: 40.1 } },
+      { matchedAddress: '123 Main Street, Other City', coordinates: { x: -74.3, y: 41.2 } },
+      { matchedAddress: 'Invalid partial match', coordinates: { x: -74.3, y: 95 } },
+    ] } })
+  }
+  if (url.hostname === 'phl.carto.com') {
+    assert.equal(request.method, 'GET')
+    assert.equal(url.pathname, '/api/v2/sql')
+    assert.match(url.searchParams.get('q')!, /ST_DWithin.*LIMIT 25$/)
+    cartoCalls++
+    return Response.json({ rows: [] })
   }
   if (url.hostname === 'ai.example.com') {
     assert.equal(request.headers.get('authorization'), ['Bearer', 'test-ai-key'].join(' '))
@@ -91,7 +114,7 @@ before(async () => {
   publicJwk = await exportJWK(pair.publicKey)
   tokens = { alice: await token('alice'), bob: await token('bob') }
   const bundle = await build({ entryPoints: ['worker/index.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false })
-  runtimeDirectory = await mkdtemp(join(tmpdir(), 'reops-backend-'))
+  runtimeDirectory = await mkdtemp(join(process.cwd(), 'worker/.backend-test-runtime-'))
   const assetFiles = new Map([
     ['/', await readFile(new URL('../index.html', import.meta.url), 'utf8')],
     ['/app.css', await readFile(new URL('../src/style.css', import.meta.url), 'utf8')],
@@ -107,7 +130,7 @@ before(async () => {
       })
     } },
     bindings: { ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin,
-      ADDRESS_API_KEY: 'test-address-key', ADDRESS_TOKEN_SECRET: signingSecret, AI_ENDPOINT: 'https://ai.example.com/analyze', AI_API_KEY: 'test-ai-key' },
+      ADDRESS_TOKEN_SECRET: signingSecret, AI_ENDPOINT: 'https://ai.example.com/analyze', AI_API_KEY: 'test-ai-key' },
     outboundService: upstream as never,
   }), resourceTmpPath: join(runtimeDirectory, 'main') })
   db = await mf.getD1Database('DB') as unknown as D1Database
@@ -272,10 +295,13 @@ test('entered drafts are preserved; only explicitly selected signed provider can
   const p = await createProperty('Address draft')
   assert.equal(p.enteredAddress, '123 Main'); assert.equal(p.verificationStatus, 'unverified'); assert.equal(p.latitude, null)
   assert.equal((await api('properties', 'POST', { name: 'Forged', enteredAddress: 'x', binId: bin.id, latitude: 42, verificationStatus: 'verified' })).status, 400)
-  const search = await api<{ candidates: { token: string; verified: boolean }[] }>('addresses/search', 'POST', { query: '123 Main' })
+  const search = await api<{ candidates: AddressCandidate[]; message: string }>('addresses/search', 'POST', { query: '123 Main' })
   assert.equal(search.status, 200)
+  assert.equal(search.data.candidates.length, 2)
   assert.equal(search.data.candidates[0].verified, true)
-  assert.equal(search.data.candidates[1].verified, false)
+  assert.equal(search.data.candidates[1].verified, true)
+  assert.match(search.data.message, /street-interpolated.*not rooftop.*legal address validation/)
+  assert.match(search.data.candidates[0].message, /Explicit selection/)
   const verified = await api<Property>(`properties/${p.id}`, 'PATCH', { version: 1, addressToken: search.data.candidates[0].token })
   assert.equal(verified.status, 200); assert.equal(verified.data.latitude, 40.1); assert.equal(verified.data.enteredAddress, '123 Main')
   assert.equal(verified.data.normalizedAddress, '123 Main St, Springfield')
@@ -287,12 +313,155 @@ test('entered drafts are preserved; only explicitly selected signed provider can
   assert.equal((await api('properties', 'POST', { name: 'Borrow token', enteredAddress: '123 Main', binId: bobBins[0].id, addressToken: search.data.candidates[0].token }, 'bob')).status, 400)
   const moved = await api<Property>(`properties/${p.id}`, 'PATCH', { version: 2, enteredAddress: 'Changed' })
   assert.equal(moved.data.latitude, null); assert.equal(moved.data.verificationStatus, 'unverified')
-  const ambiguous = await createProperty('Ambiguous', { addressToken: search.data.candidates[1].token })
-  assert.equal(ambiguous.verificationStatus, 'ambiguous'); assert.equal(ambiguous.latitude, null)
-  assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === ambiguous.id), false)
+  const secondMatch = await createProperty('Selected second Census match', { addressToken: search.data.candidates[1].token })
+  assert.equal(secondMatch.verificationStatus, 'verified'); assert.equal(secondMatch.latitude, 41.2)
+  assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === secondMatch.id), true)
   const expiredToken = await new SignJWT({ query: '123 Main', normalized: 'Fake', latitude: 1, longitude: 2, verified: true })
     .setProtectedHeader({ alg: 'HS256' }).setSubject(user.id).setIssuer('reops-address').setAudience('property-selection').setIssuedAt().setExpirationTime(1).sign(new TextEncoder().encode(signingSecret))
   assert.equal((await api('properties', 'POST', { name: 'Expired', enteredAddress: '123 Main', binId: bin.id, addressToken: expiredToken })).status, 400)
+})
+
+test('Census cache reuses conservatively normalized queries and canonical single-match aliases without fetching', async () => {
+  const count = censusCalls.length
+  const query = '  123   main  '
+  const cached = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query })
+  assert.equal(cached.status, 200)
+  assert.equal(censusCalls.length, count)
+  assert.deepEqual(cached.data.candidates.map(c => c.label), ['123 Main St, Springfield', '123 Main Street, Other City'])
+  const selected = await createProperty('Normalized cache hit', { enteredAddress: query, addressToken: cached.data.candidates[0].token })
+  assert.equal(selected.enteredAddress, query)
+  assert.equal(selected.verificationStatus, 'verified')
+  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, name: 'Unrelated edit preserves selected whitespace query' })
+  assert.equal(edited.status, 200)
+  assert.equal(edited.data.enteredAddress, query)
+  assert.equal(edited.data.verificationStatus, 'verified')
+  assert.equal(edited.data.latitude, selected.latitude)
+  assert.equal(edited.data.longitude, selected.longitude)
+  assert.equal((await api('properties', 'POST', { name: 'Cache token mismatch', enteredAddress: '123 Main', binId: bin.id, addressToken: cached.data.candidates[0].token })).status, 400)
+  const bobCached = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query }, 'bob')
+  assert.equal(censusCalls.length, count)
+  assert.equal((await api('properties', 'POST', { name: 'Wrong user cached token', enteredAddress: query, binId: bin.id, addressToken: bobCached.data.candidates[0].token })).status, 400)
+  const rows = await db.prepare('SELECT * FROM property_gps WHERE normalized_query=? ORDER BY match_order').bind('123 MAIN').all()
+  assert.equal(rows.results.length, 2)
+  for (const row of rows.results) {
+    assert.equal(row.provider, 'US Census Geocoder')
+    assert.equal(row.benchmark, 'Public_AR_Current')
+    assert.ok(Number.isFinite(Date.parse(row.fetched_at as string)))
+  }
+  await api('addresses/search', 'POST', { query: 'Single match' })
+  const afterSingle = censusCalls.length
+  const alias = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query: ' 456 oak st, springfield, ny, 12345 ' })
+  assert.equal(alias.status, 200)
+  assert.equal(alias.data.candidates[0].latitude, 41.2)
+  assert.equal(censusCalls.length, afterSingle)
+  for (const distinct of ['123 Main #1', '123 Main #2', '123 Main,', '123 Main St']) {
+    await api('addresses/search', 'POST', { query: distinct })
+    assert.equal(censusCalls.at(-1), distinct)
+  }
+  assert.equal(censusCalls.length, afterSingle + 4)
+})
+
+test('Census no/invalid matches and provider failures never become successful cache entries; drafts remain available', async () => {
+  for (const query of ['No matches', 'Invalid matches', 'Provider non-OK', 'Provider redirect', 'Malformed JSON', 'Malformed result', 'Null result']) {
+    const beforeCalls = censusCalls.length
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await api<{ candidates?: AddressCandidate[]; message?: string }>('addresses/search', 'POST', { query })
+      if (query === 'No matches' || query === 'Invalid matches') {
+        assert.equal(result.status, 200)
+        assert.deepEqual(result.data.candidates, [])
+        assert.match(result.data.message!, /unverified draft/)
+      } else {
+        assert.equal(result.status, 502)
+        assert.match(JSON.stringify(result.data), /draft can still be saved/)
+      }
+    }
+    assert.equal(censusCalls.length, beforeCalls + 2)
+    assert.equal(await db.prepare('SELECT COUNT(*) AS count FROM property_gps WHERE normalized_query=?').bind(query.toUpperCase()).first('count'), 0)
+    const draft = await createProperty(query, { enteredAddress: query })
+    assert.equal(draft.verificationStatus, 'unverified')
+    assert.equal(draft.latitude, null)
+    assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === draft.id), false)
+  }
+})
+
+test('Census request timeout and network errors are recoverable and do not cache results', async () => {
+  const originalFetch = globalThis.fetch
+  try {
+    for (const failure of [new DOMException('Timed out', 'TimeoutError'), new TypeError('Network unavailable')]) {
+      globalThis.fetch = (async (_input, options) => {
+        assert.equal(options?.method, 'GET')
+        assert.equal(options?.redirect, 'manual')
+        assert.ok(options?.signal instanceof AbortSignal)
+        throw failure
+      }) as typeof fetch
+      await assert.rejects(searchAddress({ ...env, ADDRESS_TOKEN_SECRET: signingSecret }, user, 'Timeout query'), /draft can still be saved/)
+      assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM property_gps WHERE normalized_query='TIMEOUT QUERY'").first('count'), 0)
+    }
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('oversized Census response streams are cancelled and never cached', async () => {
+  const originalFetch = globalThis.fetch
+  let chunks = 0, cancelled = false
+  try {
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        chunks++
+        controller.enqueue(new Uint8Array(25000).fill(120))
+      },
+      cancel() { cancelled = true },
+    }))) as typeof fetch
+    await assert.rejects(searchAddress({ ...env, ADDRESS_TOKEN_SECRET: signingSecret }, user, 'Oversized query'), /draft can still be saved/)
+    assert.equal(cancelled, true)
+    assert.ok(chunks <= 6)
+    assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM property_gps WHERE normalized_query='OVERSIZED QUERY'").first('count'), 0)
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('address selection rejects invalid coordinates and wrong token claims even when signed', async () => {
+  const key = new TextEncoder().encode(signingSecret)
+  const base = { query: '123 Main', normalized: '123 Main St', verified: true, latitude: 40.1, longitude: -73.2 }
+  const badPayloads = [
+    { latitude: 91 }, { longitude: -181 }, { latitude: NaN }, { longitude: Infinity },
+    { latitude: '40.1' }, { longitude: null }, { normalized: '' }, { verified: 'true' },
+  ]
+  for (const changes of badPayloads) {
+    const signed = await new SignJWT({ ...base, ...changes }).setProtectedHeader({ alg: 'HS256' })
+      .setSubject(user.id).setIssuer('reops-address').setAudience('property-selection').setIssuedAt().setExpirationTime('15m').sign(key)
+    await assert.rejects(addressSelection({ ...env, ADDRESS_TOKEN_SECRET: signingSecret }, user, '123 Main', signed), /Invalid, expired, or mismatched/)
+  }
+  for (const claim of ['issuer', 'audience', 'subject', 'expiry', 'issuedAt']) {
+    let jwt = new SignJWT(base).setProtectedHeader({ alg: 'HS256' })
+      .setSubject(claim === 'subject' ? 'someone-else' : user.id)
+      .setIssuer(claim === 'issuer' ? 'wrong' : 'reops-address')
+      .setAudience(claim === 'audience' ? 'wrong' : 'property-selection')
+    if (claim !== 'issuedAt') jwt = jwt.setIssuedAt()
+    if (claim !== 'expiry') jwt = jwt.setExpirationTime('15m')
+    const signed = await jwt.sign(key)
+    await assert.rejects(addressSelection({ ...env, ADDRESS_TOKEN_SECRET: signingSecret }, user, '123 Main', signed), /Invalid, expired, or mismatched/)
+  }
+})
+
+test('area lookup enforces property access and inputs and fetches public data in the production Worker runtime', async () => {
+  const beforeCalls = cartoCalls
+  const draft = await createProperty('Area lookup draft')
+  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
+  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`)).status, 400)
+  const search = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query: '123 Main' })
+  const located = await createProperty('Area lookup selected Census match', { addressToken: search.data.candidates[0].token })
+  assert.equal((await api(`properties/${located.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
+  assert.equal((await api(`properties/${located.id}/area?county=unsupported`)).status, 400)
+  assert.equal(cartoCalls, beforeCalls)
+  const area = await api<PropertyArea>(`properties/${located.id}/area?county=philadelphia`)
+  assert.equal(area.status, 200)
+  assert.equal(area.data.county, 'philadelphia')
+  assert.equal(cartoCalls, beforeCalls + 7)
+  assert.equal(area.data.sources.filter(source => source.status === 'ok').length, 7)
+  assert.equal(area.data.sources.some(source => source.status === 'unavailable'), false)
+  for (const source of area.data.sources.filter(source => source.status === 'ok')) {
+    assert.deepEqual(source.records, [])
+    assert.equal(source.limited, false)
+  }
 })
 
 test('safe owner-scoped layer configuration and saved preferences persist server-side', async () => {

@@ -17,7 +17,7 @@ export class PropertyMap {
     const canvas = el('div', 'map-canvas')
     canvas.setAttribute('aria-label', 'Property map. Use plus and minus to zoom; select a marker to open details.')
     container.append(canvas, this.tileStatus)
-    this.map = L.map(canvas).setView([49.21, -122.92], 11)
+    this.map = L.map(canvas).setView([39.95, -75.16], 11)
     const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     }).addTo(this.map)

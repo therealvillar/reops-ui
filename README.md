@@ -4,10 +4,10 @@ A TypeScript property-record workspace deployed as a Cloudflare Worker with D1 p
 
 ## Architecture and defaults
 
-- **Frontend:** vanilla TypeScript, Vite, and Leaflet. No framework existed in the original workspace. Property data and preferences are not persisted in browser storage. An empty map starts over New Westminster; populated maps fit their locations.
+- **Frontend:** vanilla TypeScript, Vite, and Leaflet. No framework existed in the original workspace. Property data and preferences are not persisted in browser storage. An empty map starts over Philadelphia; populated maps fit their locations.
 - **Backend:** Cloudflare Workers and D1, signed Cloudflare Access identity, server-side address and AI adapters, and a once-per-minute Cron Trigger.
 - **Access:** private records by default, owned by a stable authenticated user ID. Owners can explicitly grant viewer/editor access to another registered user's exact ID. Stamps are display identifiers, never authentication credentials. Editors preserve the original creator; viewers cannot mutate records.
-- **Verification:** geocoding and verification are separate. An address remains a draft until a user selects a server-validated candidate. Missing credentials, ambiguous matches, and verification failures must not be treated as verified.
+- **Addresses:** US Census geocoding is free, keyless, and US-only. An address remains a draft until a user explicitly selects a signed match. The legacy `verified` status means a selected geocoded match, not USPS, rooftop, occupancy, or legal address verification. Census coordinates can be interpolated along a street.
 - **Reminders:** timestamps are stored as UTC instants with an IANA time-zone label. Enter an explicit UTC offset matching that zone to disambiguate daylight-saving transitions. Cron delivers durable in-app notifications without an open tab; the browser polls for delivery. Editing a delivered reminder does not reschedule it—create a new reminder for another alarm. No email/SMS channel is configured.
 - **AI:** read-only analysis by default. Manual actions and opted-in automatic rules share only selected fields. Results are not executed as instructions and cannot modify records or invoke tools.
 - **Visual reference:** `therealvillar/newwest-calendar` returned 404 during inspection. The interface uses an independent accessible neutral design; screenshots or source files are needed to match that reference.
@@ -57,7 +57,7 @@ The initial release target, confirmed by the account's Workers subdomain API, is
 
 The first iteration is deployed at **https://reops-ui.anthonyrvillar.workers.dev** behind hostname-scoped Cloudflare Access. The user-authorized management profile resolved the earlier Access permission blocker. The application allows only the verified account owner's exact email; its actual team domain and audience are configured. Anonymous requests to the root, HTML, JavaScript asset, and API redirect to Access login. Preview URLs are disabled so alternate version hostnames cannot serve an unprotected copy. Production `DEV_AUTH` is absent, the existing D1 database is preserved, and no paid upgrade or unrelated Access policy change was made.
 
-Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Address verification and AI remain optional server-side integrations requiring the credentials documented below.
+Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Address selection requires a server-side signing secret, and AI requires the optional credentials documented below.
 
 Automated production-mode integration coverage runs the real Worker bundle against isolated D1 with locally generated RSA keys and mock JWKS, without `DEV_AUTH`. It verifies that valid issuer/audience assertions reach the D1 identity API and a file-backed `ASSETS` service serving repository HTML/CSS, while missing, malformed, wrong-issuer, and wrong-audience assertions reject both asset and API requests. This checks Worker authentication and asset-binding delegation, not a real browser login or Cloudflare's internal static-asset router. The deployed version and bindings, remote migration ledger, exact-owner Access policy, and anonymous production redirects were also checked independently.
 
@@ -67,14 +67,27 @@ Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or com
 
 ### Addresses
 
-Enable **Google Places API (New)** for autocomplete and **Google Address Validation API** for verification, then configure a restricted server-side key. Exact premise-level validation is required; a geocoded suggestion alone is never verified. Provider coverage varies by country.
+All property creation/editing flows use the server-side US Census Bureau geocoder at `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` with the current public benchmark. Enter a complete US street address, city, state, and ZIP for best results; this is not a partial-address autocomplete provider. No geocoding API key is needed.
 
 ```sh
-npx wrangler secret put ADDRESS_API_KEY
 npx wrangler secret put ADDRESS_TOKEN_SECRET
 ```
 
-Use a cryptographically random signing secret of at least 32 bytes for candidate tokens. API-key restrictions must permit the server adapter, not arbitrary browser calls. No coordinates or verification claims supplied by a browser are trusted. Without these secrets users can still save unverified drafts; lookup errors are shown explicitly.
+Use a cryptographically random signing secret of at least 32 bytes for candidate tokens. No coordinates or verification claims supplied by a browser are trusted. Without the signing secret users can still save unverified drafts; lookup errors are shown explicitly. Selecting a match preserves the entered address and separately saves the normalized address.
+
+Apply the new `0005_property_gps.sql` migration before using address lookup (`npm run db:local` or, after backing up production, `npm run db:remote`). The D1 `property_gps` table stores public geocoding results, not ownership or private property attributes. Address lookup checks this cache before calling Census. Existing property records are preserved; select a Census match when editing an older record to update its location. Remove the obsolete `ADDRESS_API_KEY` deployment secret if present.
+
+### Nearby public data
+
+The shared property dossier includes an explicit **Load nearby data** action. Select Philadelphia, Montgomery, Bucks, or Delaware County. The authenticated `GET /api/properties/:id/area?county=...` endpoint enforces the same owner/member access as the dossier, and queries only server-approved public services using the saved coordinates. It does not accept arbitrary upstream URLs or SQL. Loading sends the location to those services; results are read-only and do not change the property, its AI opt-in, or map layers.
+
+Queries use a fixed 500-meter radius and return at most 25 records per source, with retrieval time, source attribution, truncation notices, and isolated service errors. Empty results are distinct from unavailable sources. Public data may be stale or incomplete and is not a legal, title, zoning, or flood determination. Sheriff auctions and post-sale distributions are reference links, not scraped auction feeds; verify current details on the source sites. Links omit analytics parameters such as `_ga`.
+
+Philadelphia queries the City CARTO `opa_properties_public`, `rtt_summary`, `permits`, `violations`, `clean_seal`, `business_licenses`, and `demolitions` datasets. Montgomery uses County GIS parcels (FeatureServer layer 6). Bucks parcels (layer 0) and Delaware zoning (layer 0) have adapters but are **disabled by default**: Bucks publishes a no-commercial-use/resale restriction, and Delaware's catalog requests permission with no reuse license provided. Obtain the necessary permission before setting deployment variables `BUCKS_PARCELS_ENABLED="true"` or `DELAWARE_ZONING_ENABLED="true"`. Otherwise these appear as reference links with the reason, not empty successful lookups. ArcGIS queries intersect a 64-segment geodesic approximation of the 500-meter circle; parcel/zoning polygons may intersect the area without their centers lying inside it. County selection is explicit, not inferred from an address or asserted to be a county-boundary check.
+
+Review the published [Bucks parcel terms](https://www.arcgis.com/home/item.html?id=3a4d9c4305874312a2a74da7bd55a22d&sublayer=0), [Delaware zoning licensing page](https://delaware-county-pennsylvania-dcpd.hub.arcgis.com/datasets/delaware-county-zoning/about), and [Montgomery parcel terms](https://www.montcopa.maps.arcgis.com/home/item.html?id=228cad7975554088a350bee4caf3ca45&sublayer=6). Montgomery describes its parcels as a free and open, as-is resource.
+
+Source endpoints were verified against public catalogs and published REST metadata; live requests could not be exercised from the development sandbox because the source hosts did not resolve. Test coverage uses mocked public responses. Verify service availability and applicable reuse terms before production use. The Bucks floodplain viewer remains a reference link; no flood-zone determination is inferred from parcels. The supplied Berks auction link is retained as a supplemental reference outside the four-county proximity coverage.
 
 ### AI
 

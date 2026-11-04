@@ -1,4 +1,4 @@
-import type { AddressCandidate, AIRule, Bin, Detail, Property, Reminder } from '../shared/types'
+import type { AddressCandidate, AIRule, Bin, Detail, Property, PropertyArea, Reminder } from '../shared/types'
 import { announce, api, button, dialog, el, errorMessage, input, label, select, submitForm } from './dom'
 import { attributeNamePattern, newPropertyAIRule, validateReminderInstant } from './utils'
 
@@ -83,19 +83,20 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   candidates.id = `candidates-${crypto.randomUUID()}`
   candidates.setAttribute('role', 'listbox')
   address.setAttribute('aria-controls', candidates.id)
-  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Confirm an address suggestion when available. Drafts can be saved without verification.')
+  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US address, city, state, and ZIP, then select a Census match. Drafts can be saved without a location.')
   status.setAttribute('role', 'status')
   let token: string | undefined
   let selectedAddress: string | undefined
   let sequence = 0
   let timer: ReturnType<typeof setTimeout>
   const choose = (candidate: AddressCandidate) => {
-    address.value = candidate.label
-    selectedAddress = candidate.label
+    clearTimeout(timer)
+    ++sequence
+    selectedAddress = address.value
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
-    status.textContent = candidate.message
+    status.textContent = `${candidate.label}: ${candidate.message}`
     address.focus()
   }
   address.addEventListener('input', () => {
@@ -107,8 +108,9 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
     if (address.value.trim().length < 3) { status.textContent = 'Type at least 3 characters to search addresses.'; return }
     status.textContent = 'Searching addresses…'
     timer = setTimeout(async () => {
+      const query = address.value
       try {
-        const result = await api<{ candidates: AddressCandidate[]; message: string }>('/addresses/search', 'POST', { query: address.value })
+        const result = await api<{ candidates: AddressCandidate[]; message: string }>('/addresses/search', 'POST', { query })
         if (current !== sequence || !address.isConnected) return
         status.textContent = result.message
         for (const candidate of result.candidates) {
@@ -138,7 +140,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
     label('Pipeline bin', bin), label('Tags', tags, 'Separate tags with commas.'), attrs.node)
   submitForm(form, property ? 'Save property' : 'Create property', async () => {
     const body: Record<string, unknown> = {
-      name: name.value.trim(), enteredAddress: address.value.trim(), binId: bin.value,
+      name: name.value.trim(), enteredAddress: address.value, binId: bin.value,
       tags: [...new Set(tags.value.split(',').map(t => t.trim()).filter(Boolean))], attributes: attrs.value(),
     }
     if (property) body.version = property.version
@@ -225,11 +227,11 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     }, 'text-button'))
     summary.append(title, stamp(p.creatorName, p.creatorStamp))
     const verify = el('div', `verification ${p.verificationStatus}`)
-    verify.append(el('strong', '', `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address verification result available.'))
+    verify.append(el('strong', '', p.verificationStatus === 'verified' ? 'Address location selected' : `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address location result available.'))
     if (p.normalizedAddress) verify.append(el('p', '', p.normalizedAddress))
     const progress = el('div', 'progress-card')
     const milestones = [Boolean(p.name && p.enteredAddress), p.verificationStatus === 'verified', detail.notes.length > 0, detail.reminders.some(r => ['scheduled', 'delivered', 'completed'].includes(r.state))]
-    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · address verified · insight noted · next step planned'))
+    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · location selected · insight noted · next step planned'))
     const bar = el('progress'); bar.max = 4; bar.value = milestones.filter(Boolean).length; bar.setAttribute('aria-label', 'Useful property completion')
     progress.append(bar)
     const edit = section('Property details', 'Your creator stamp stays with this record, wherever it goes.')
@@ -290,7 +292,7 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     const collaboration = p.creatorId === context.userId()
       ? sharingSection(id, refresh)
       : section('Shared access', 'Access was granted to your stable user ID. Only the property owner can manage collaborators. Viewer accounts can read; editor accounts can save changes. The server checks every action.')
-    body.append(summary, verify, progress, edit, collaboration, notes, reminders, analysis, history)
+    body.append(summary, verify, progress, edit, areaSection(p), collaboration, notes, reminders, analysis, history)
     if (active && !active.isConnected) body.querySelector<HTMLElement>('input,button')?.focus()
   }
   body.append(el('p', 'loading', 'Opening the dossier…'))
@@ -300,6 +302,38 @@ export async function openProperty(id: string, context: DetailContext): Promise<
       try { await refresh() } catch (retryError) { showInlineError(body, retryError) }
     }))
   }
+}
+
+function areaSection(property: Property): HTMLElement {
+  const section = el('section', 'detail-section')
+  section.append(el('h3', '', 'Nearby public data'), el('p', 'muted', 'Read-only public records within 500 meters of the selected Census location. Choose the county containing the property. These records are not a title, flood-risk, zoning, or legal determination. Loading shares the location with the selected public data providers.'))
+  const county = select('area-county', [
+    { value: 'philadelphia', label: 'Philadelphia' }, { value: 'montgomery', label: 'Montgomery' },
+    { value: 'bucks', label: 'Bucks' }, { value: 'delaware', label: 'Delaware' },
+  ], 'philadelphia')
+  const results = el('div', 'stack')
+  results.setAttribute('aria-live', 'polite')
+  section.append(label('County for public data', county), button('Load nearby data', async () => {
+    results.replaceChildren(el('p', 'muted', 'Loading public sources…'))
+    try {
+      const area = await api<PropertyArea>(`/properties/${encodeURIComponent(property.id)}/area?county=${encodeURIComponent(county.value)}`)
+      results.replaceChildren(el('p', 'muted', `Retrieved ${dateText(area.fetchedAt)} · radius ${area.radiusMeters} m · at most 25 records per source`))
+      for (const source of area.sources) {
+        const card = el('article', 'progress-card stack')
+        const link = el('a', '', source.name)
+        link.href = source.url; link.target = '_blank'; link.rel = 'noopener noreferrer'
+        card.append(link, el('p', source.status === 'unavailable' ? 'error-text' : 'muted', source.message))
+        if (source.limited) card.append(el('p', 'muted', 'Result limit reached; additional records may exist.'))
+        for (const record of source.records) {
+          const item = el('details')
+          item.append(el('summary', '', String(record.address ?? record.location ?? record.parcel_number ?? 'Public record')), el('pre', 'history-values', JSON.stringify(record, null, 2)))
+          card.append(item)
+        }
+        results.append(card)
+      }
+    } catch (error) { results.replaceChildren(el('p', 'error-text', errorMessage(error))) }
+  }, 'button small'), results)
+  return section
 }
 
 function showInlineError(container: HTMLElement, error: unknown): void {
