@@ -92,7 +92,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   const choose = (candidate: AddressCandidate, query: string) => {
     clearTimeout(timer)
     ++sequence
-    selectedAddress = query
+    selectedQuery = query
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')

@@ -205,8 +205,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           assignments.push('updated_by=?')
           values.push(user.id, subId, id, user.id, user.id)
           const stateGuard = b.state === undefined ? '' : ' AND state=?'
+          const deliveryGuard = b.state === 'scheduled' ? " AND state!='delivered' AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.reminder_id=reminders.id)" : ''
           if (b.state !== undefined) values.push(old.state)
-          const updated = await env.DB.prepare(`UPDATE reminders SET ${assignments.join(',')} WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor')))${stateGuard} RETURNING *`)
+          const updated = await env.DB.prepare(`UPDATE reminders SET ${assignments.join(',')} WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor')))${stateGuard}${deliveryGuard} RETURNING *`)
             .bind(...values).first<ReminderRow>()
           assert(updated, b.state === undefined ? 'Property access changed; reload' : 'Reminder state changed. Reload before saving.', b.state === undefined ? 403 : 409)
           return response(reminderModel(updated))
