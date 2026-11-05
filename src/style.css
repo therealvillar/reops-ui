@@ -100,7 +100,7 @@ textarea { resize: vertical; line-height: 1.6 }
 .global-notice { background: #fff0e9; color: #913f27; border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; font-size: .82rem }
 .global-notice .text-button { color: #913f27; margin-left: 10px }
 .view-content { min-height: 410px }
-.map-view { height: 490px; position: relative; padding: 0 }
+.map-view { height: clamp(440px, 70vh, 880px); position: relative; padding: 0 }
 .map-canvas { width: 100%; height: 100%; z-index: 1 }
 .map-status { position: absolute; bottom: 10px; left: 10px; max-width: 65%; z-index: 500; background: #ffffffed; color: #415349; padding: 6px 9px; font-size: .65rem; border-radius: 4px; box-shadow: 0 1px 4px #172b3610 }
 .map-legend { display: grid; gap: 8px; border-top: 1px solid #edf0e8; padding: 11px 20px; background: #fbfcf9; font-size: .67rem }
@@ -113,6 +113,7 @@ textarea { resize: vertical; line-height: 1.6 }
 .map-legend p { font-size: .68rem }
 .map-pin { display: grid; place-items: center; width: 34px; height: 34px; border: 3px solid white; border-radius: 50% 50% 50% 7px; background: var(--pin-color, #166b63); color: white; box-shadow: 0 2px 7px #172b3640; font: 700 19px system-ui }
 .map-pin.cluster { border-radius: 50%; font-size: 12px; border-width: 4px; box-shadow: 0 0 0 5px #ffffff80, 0 2px 7px #172b3640 }
+.map-pin.selected { box-shadow: 0 0 0 5px #ffcb68, 0 3px 12px #172b3670 }
 .leaflet-container { font-family: 'DM Sans', system-ui, sans-serif; background: #e8eee4 }
 .leaflet-tooltip { font-family: inherit }
 .leaflet-popup-content .cluster-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto }
@@ -216,6 +217,10 @@ progress { accent-color: var(--teal); width: 100%; height: 9px; border: none; di
 .ai-result { background: white; border-left: 3px solid #72a084; padding: 14px; line-height: 1.75 }
 .history-item { border-bottom: 1px solid var(--line); padding: 9px 0 }
 .history-values { font-size: .7rem; background: #f5f7f0; padding: 14px; overflow-x: auto; max-height: 280px }
+.source-attributes { display: grid; grid-template-columns: minmax(110px, 1fr) 2fr; gap: 8px 18px; font-size: .75rem }
+.source-attributes dt { font-weight: 700 }
+.source-attributes dd { margin: 0; overflow-wrap: anywhere }
+.source-record > summary { cursor: pointer; font-size: .78rem; font-weight: 600 }
 .notification.unread { border-left: 3px solid var(--teal) }
 .notification.read { opacity: .8 }
 .column-choices { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px }
@@ -226,7 +231,7 @@ progress { accent-color: var(--teal); width: 100%; height: 9px; border: none; di
 .sort-row select { min-width: 0 }
 .bin-form { display: grid; grid-template-columns: 1fr 65px 65px; gap: 10px; padding-bottom: 20px; border-bottom: 1px solid var(--line) }
 .bin-form .form-feedback, .bin-form .button { grid-column: 1 / -1; justify-self: start }
-@media (min-width: 1600px) { .map-view { height: 600px } .page { padding-top: 46px } }
+@media (min-width: 1600px) { .page { padding-top: 46px } }
 @media (max-width: 1100px) {
   .sidebar { width: 184px; padding-inline: 14px }
   .main { margin-left: 184px; width: calc(100% - 184px) }
@@ -272,7 +277,7 @@ progress { accent-color: var(--teal); width: 100%; height: 9px; border: none; di
   .results-bar { padding-inline: 12px }
   .map-legend { padding-inline: 12px }
   .legend-bins, .legend-layers { gap: 10px }
-  .map-view { height: 430px }
+  .map-view { height: clamp(400px, 65dvh, 680px) }
   .map-empty { top: 18px; right: 14px; padding: 15px; width: 240px }
   .map-status { max-width: 75%; bottom: 28px; font-size: .58rem }
   .page-footer { padding-inline: 20px; font-size: .6rem }

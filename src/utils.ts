@@ -1,8 +1,9 @@
 import type { AIRule, Bin, Layer, LayerFeature, Property, SavedView } from '../shared/types'
+import { propertyLabel } from '../shared/property'
 
 export const defaultView: SavedView = {
-  columns: ['name', 'enteredAddress', 'binId', 'tags', 'verificationStatus'],
-  sorts: [{ field: 'name', direction: 'asc' }],
+  columns: ['displayAddress', 'binId', 'tags', 'verificationStatus', 'updatedAt'],
+  sorts: [{ field: 'displayAddress', direction: 'asc' }],
   filters: { search: '', binId: '', tag: '', attribute: '', value: '' },
   layers: ['properties'],
 }
@@ -11,19 +12,31 @@ export const attributeNamePattern = '[A-Za-z][\\w \\-]{0,63}'
 
 export function newPropertyAIRule(rule: AIRule | null): AIRule {
   return rule ? structuredClone(rule) : {
-    enabled: false, triggers: ['creation'], watchedFields: [], fields: ['name', 'enteredAddress'],
+    enabled: false, triggers: ['creation'], watchedFields: [], fields: ['enteredAddress'],
   }
 }
 
 export const fieldLabels: Record<string, string> = {
-  name: 'Property', enteredAddress: 'Address', normalizedAddress: 'Geocoded address',
+  name: 'Address (legacy column)', displayAddress: 'Address', enteredAddress: 'Entered address', normalizedAddress: 'Geocoded address',
   binId: 'Bin', tags: 'Tags', verificationStatus: 'Address status', creatorStamp: 'Creator stamp',
   creatorName: 'Created by', createdAt: 'Created', updatedAt: 'Updated', version: 'Version',
   latitude: 'Latitude', longitude: 'Longitude',
 }
 
 export function fieldValue(property: Property, field: string): unknown {
+  if (field === 'name' || field === 'displayAddress') return propertyLabel(property)
   return field.startsWith('attributes.') ? property.attributes[field.slice(11)] : property[field as keyof Property]
+}
+
+export function restoreSavedView(value: unknown): SavedView {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Saved view is invalid. The default view is shown; save it to replace the old preference.')
+  const saved = value as Partial<SavedView>
+  if (!Array.isArray(saved.layers) || !saved.layers.every(id => typeof id === 'string') ||
+      !Array.isArray(saved.columns) || !Array.isArray(saved.sorts) ||
+      !saved.filters || typeof saved.filters !== 'object') {
+    throw new Error('Saved view is invalid. The default view is shown; save it to replace the old preference.')
+  }
+  return { ...structuredClone(defaultView), ...saved, filters: { ...defaultView.filters, ...saved.filters } }
 }
 
 export function displayValue(value: unknown): string {
@@ -83,7 +96,7 @@ export function filterProperties(properties: Property[], view: SavedView): Prope
   const { search, binId, tag, attribute, value } = view.filters
   const needle = search.trim().toLocaleLowerCase()
   return properties.filter(p =>
-    (!needle || [p.name, p.enteredAddress, p.normalizedAddress, ...p.tags, ...Object.values(p.attributes)]
+    (!needle || [propertyLabel(p), p.name, p.enteredAddress, p.normalizedAddress, ...p.tags, ...Object.values(p.attributes)]
       .some(v => String(v ?? '').toLocaleLowerCase().includes(needle))) &&
     (!binId || p.binId === binId) &&
     (!tag || p.tags.some(t => t.toLocaleLowerCase() === tag.toLocaleLowerCase())) &&

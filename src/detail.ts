@@ -1,4 +1,5 @@
 import type { AddressCandidate, AIRule, Bin, Detail, Property, PropertyArea, Reminder } from '../shared/types'
+import { propertyLabel } from '../shared/property'
 import { announce, api, button, dialog, el, errorMessage, input, label, select, submitForm } from './dom'
 import { attributeNamePattern, newPropertyAIRule, validateReminderInstant } from './utils'
 
@@ -71,10 +72,9 @@ function attributeEditor(attributes: Property['attributes']): { node: HTMLElemen
 
 function propertyForm(property: Property | undefined, bins: Bin[], save: (body: Record<string, unknown>) => Promise<void>): HTMLFormElement {
   const form = el('form', 'stack')
-  const name = input('name', property?.name)
-  name.required = true; name.maxLength = 200
+  const creationKey = crypto.randomUUID()
   const address = input('address', property?.enteredAddress)
-  address.required = true; address.maxLength = 500
+  address.maxLength = 500
   address.autocomplete = 'off'
   address.setAttribute('role', 'combobox')
   address.setAttribute('aria-autocomplete', 'list')
@@ -136,14 +136,24 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   bin.required = true
   const tags = input('tags', property?.tags.join(', '))
   const attrs = attributeEditor(property?.attributes ?? {})
-  form.append(label('Property name', name), label('Street address', address), candidates, status,
+  const draft = input('unlocatedDraft', '', 'checkbox')
+  const duplicate = input('allowDuplicate', '', 'checkbox')
+  form.append(label('Street address', address, 'Enter a complete US address. An unambiguous Census match locates the property on save.'), candidates, status,
+    ...(!property ? [label('Create an unlocated draft if the address cannot be geocoded yet', draft),
+      label('Create a separate record even if this address already exists in my accessible properties', duplicate)] : []),
     label('Pipeline bin', bin), label('Tags', tags, 'Separate tags with commas.'), attrs.node)
   submitForm(form, property ? 'Save property' : 'Create property', async () => {
+    if (!address.value.trim() && !property && !draft.checked) throw new Error('Enter an address, or explicitly create an unlocated draft.')
     const body: Record<string, unknown> = {
-      name: name.value.trim(), enteredAddress: address.value, binId: bin.value,
+      enteredAddress: address.value, binId: bin.value,
       tags: [...new Set(tags.value.split(',').map(t => t.trim()).filter(Boolean))], attributes: attrs.value(),
     }
     if (property) body.version = property.version
+    else {
+      body.idempotencyKey = creationKey
+      if (draft.checked) body.unlocatedDraft = true
+      if (duplicate.checked) body.allowDuplicate = true
+    }
     if (token && selectedQuery === address.value) body.addressToken = token
     await save(body)
   })
@@ -220,7 +230,8 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     const p = detail.property
     const summary = el('div', 'dossier-summary')
     const title = el('div')
-    title.append(el('p', 'eyebrow', 'PROPERTY DOSSIER'), el('h2', '', p.name), el('p', 'muted', p.enteredAddress))
+    title.append(el('p', 'eyebrow', 'PROPERTY DOSSIER'), el('h2', '', propertyLabel(p)))
+    if (p.normalizedAddress && p.normalizedAddress !== p.enteredAddress) title.append(el('p', 'muted', `Entered: ${p.enteredAddress}`))
     title.append(button('Reload latest record', async () => {
       try { await refresh(); announce('Latest record loaded. Unsaved form edits were replaced.') }
       catch (error) { showInlineError(body, error) }
@@ -230,7 +241,7 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     verify.append(el('strong', '', p.verificationStatus === 'verified' ? 'Address geocoded' : `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address location result available.'))
     if (p.normalizedAddress) verify.append(el('p', '', p.normalizedAddress))
     const progress = el('div', 'progress-card')
-    const milestones = [Boolean(p.name && p.enteredAddress), p.verificationStatus === 'verified', detail.notes.length > 0, detail.reminders.some(r => ['scheduled', 'delivered', 'completed'].includes(r.state))]
+    const milestones = [Boolean(p.id), p.verificationStatus === 'verified', detail.notes.length > 0, detail.reminders.some(r => ['scheduled', 'delivered', 'completed'].includes(r.state))]
     progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · address geocoded · insight noted · next step planned'))
     const bar = el('progress'); bar.max = 4; bar.value = milestones.filter(Boolean).length; bar.setAttribute('aria-label', 'Useful property completion')
     progress.append(bar)
@@ -292,7 +303,7 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     const collaboration = p.creatorId === context.userId()
       ? sharingSection(id, refresh)
       : section('Shared access', 'Access was granted to your stable user ID. Only the property owner can manage collaborators. Viewer accounts can read; editor accounts can save changes. The server checks every action.')
-    body.append(summary, verify, progress, edit, areaSection(p), collaboration, notes, reminders, analysis, history)
+    body.append(summary, verify, progress, edit, enrichmentSection(id, detail, refresh), areaSection(p), collaboration, notes, reminders, analysis, history)
     if (active && !active.isConnected) body.querySelector<HTMLElement>('input,button')?.focus()
   }
   body.append(el('p', 'loading', 'Opening the dossier…'))
@@ -333,6 +344,61 @@ function areaSection(property: Property): HTMLElement {
       }
     } catch (error) { results.replaceChildren(el('p', 'error-text', errorMessage(error))) }
   }, 'button small'), results)
+  return section
+}
+
+function enrichmentSection(id: string, detail: Detail, refresh: () => Promise<void>): HTMLElement {
+  const section = el('section', 'detail-section')
+  section.append(el('h3', '', 'Matched public property records'),
+    el('p', 'muted', 'Only exact, checked parcel or street/ZIP/unit matches appear here. Source observations are separate from your CRM fields. Nearby records below are not evidence of a match.'))
+  const source = detail.enrichmentSources.find(item => item.id === 'philadelphia_opa')
+  if (source) {
+    const link = el('a', '', source.name)
+    link.href = source.url; link.target = '_blank'; link.rel = 'noopener noreferrer'
+    section.append(link, el('p', source.enabled ? 'muted' : 'error-text', source.message))
+  }
+  const jobs = el('div', 'stack')
+  for (const job of detail.enrichment) {
+    const card = el('article', 'progress-card stack')
+    card.append(el('strong', '', `${job.sourceId.replaceAll('_', ' ')} · ${job.status.replace('_', ' ')}`),
+      el('p', 'muted', `Requested ${dateText(job.createdAt)} · ${job.attempts} attempt(s)${job.completedAt ? ` · finished ${dateText(job.completedAt)}` : ''}`))
+    if (job.lastError) card.append(el('p', 'error-text', job.lastError))
+    jobs.append(card)
+  }
+  if (!detail.enrichment.length) jobs.append(el('p', 'muted', 'No exact-property enrichment has been queued. Data sources may be unavailable for this address or not yet approved.'))
+  section.append(jobs)
+  const attributes = el('dl', 'source-attributes')
+  for (const item of detail.sourceAttributes) {
+    attributes.append(el('dt', '', item.key.replace(/([A-Z])/g, ' $1')), el('dd', '', `${item.value ?? 'Not reported'} · ${item.sourceId} · ${dateText(item.observedAt)}`))
+  }
+  if (detail.sourceAttributes.length) section.append(el('h3', '', 'Source-reported attributes'), attributes)
+  for (const record of detail.sourceRecords) {
+    const item = el('details', 'source-record')
+    item.append(el('summary', '', `OPA parcel ${record.sourceRecordId} · ${record.matchConfidence.replace('_', ' ')} · retrieved ${dateText(record.fetchedAt)}`),
+      el('p', 'muted', `Match: ${record.matchMethod.replace('_', ' ')} · source assessment: ${record.sourceUpdatedAt ?? 'not reported'}`),
+      el('pre', 'history-values', JSON.stringify(record.data, null, 2)))
+    section.append(item)
+  }
+  const actions = el('div', 'button-row')
+  let key = crypto.randomUUID()
+  actions.append(button('Refresh match', async () => {
+    try {
+      await api(`/properties/${encodeURIComponent(id)}/enrichment`, 'POST', { idempotencyKey: key })
+      key = crypto.randomUUID()
+      announce('Enrichment queued. The background worker will process it; refresh status later.')
+      await refresh()
+    } catch (error) { showInlineError(section, error) }
+  }, 'button small'), button('Refresh status', async () => {
+    try { await refresh() } catch (error) { showInlineError(section, error) }
+  }, 'text-button'))
+  section.append(actions)
+  const unavailable = detail.enrichmentSources.filter(item => !item.enabled)
+  if (unavailable.length) {
+    const details = el('details', 'source-record')
+    details.append(el('summary', '', `${unavailable.length} other sources not enabled for exact-property ingestion`))
+    for (const item of unavailable) details.append(el('p', 'muted', `${item.name}: ${item.message}`))
+    section.append(details)
+  }
   return section
 }
 
@@ -436,7 +502,7 @@ function editReminder(id: string, reminder: Reminder | undefined, refresh: () =>
   modal.body.append(form)
 }
 
-const aiFields = ['name', 'enteredAddress', 'normalizedAddress', 'verificationStatus', 'binId', 'tags', 'attributes', 'latitude', 'longitude']
+const aiFields = ['enteredAddress', 'normalizedAddress', 'verificationStatus', 'binId', 'tags', 'attributes', 'latitude', 'longitude']
 
 function fieldChecks(title: string, selected: string[]): { node: HTMLElement; value: () => string[] } {
   const node = el('fieldset', 'check-list')
@@ -445,6 +511,12 @@ function fieldChecks(title: string, selected: string[]): { node: HTMLElement; va
   for (const field of aiFields) {
     const check = input('ai-field', field, 'checkbox'); check.checked = selected.includes(field)
     controls.push(check); node.append(label(field, check))
+  }
+  if (selected.includes('name')) {
+    const legacy = input('ai-field', 'name', 'checkbox')
+    legacy.checked = true
+    controls.push(legacy)
+    node.append(label('Legacy property name (existing rules only)', legacy))
   }
   return { node, value: () => controls.filter(c => c.checked).map(c => c.value) }
 }
@@ -460,7 +532,7 @@ function ruleEditor(rule: AIRule | null, save: (rule: AIRule) => Promise<void>, 
     checks.push(check); triggers.append(label(trigger.replace('_', ' '), check))
   }
   const watched = fieldChecks('Watched fields for field-change triggers', rule?.watchedFields ?? [])
-  const shared = fieldChecks('Fields shared on every automatic run', rule?.fields ?? ['name', 'enteredAddress'])
+  const shared = fieldChecks('Fields shared on every automatic run', rule?.fields ?? ['enteredAddress'])
   const autoConsent = input('automatic-consent', '', 'checkbox')
   form.append(triggers, watched.node, shared.node, label(defaults
     ? 'I consent to sharing these fields from all future properties with the analysis provider when the selected triggers occur.'
@@ -484,7 +556,7 @@ function ruleEditor(rule: AIRule | null, save: (rule: AIRule) => Promise<void>, 
 function aiSection(id: string, detail: Detail, refresh: () => Promise<void>, section: (title: string, description?: string) => HTMLElement): HTMLElement {
   const block = section('A second perspective', 'AI is an optional, read-only analysis. It cannot edit your property, move a bin, or schedule a reminder. Only selected fields are shared with the authorized analysis provider.')
   const manual = el('form', 'stack')
-  const fields = fieldChecks('Fields to share for this analysis', ['name', 'enteredAddress'])
+  const fields = fieldChecks('Fields to share for this analysis', ['enteredAddress'])
   const consent = input('consent', '', 'checkbox'); consent.required = true
   manual.append(fields.node, label('I consent to sharing the selected fields with the analysis provider.', consent))
   let key = crypto.randomUUID()

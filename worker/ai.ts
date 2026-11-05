@@ -1,4 +1,5 @@
 import type { AIJob, Property } from '../shared/types'
+import { propertyLabel } from '../shared/property'
 import type { Env } from './index'
 import { assert, HttpError } from './validation'
 
@@ -64,9 +65,9 @@ export async function processJobs(env: Env): Promise<void> {
     if (!claimed) return
     try {
       const endpoint = requireAI(env)
-      const property = JSON.parse(claimed.payload) as Record<string, unknown>
+      const property = JSON.parse(claimed.payload) as Property
       const fields = JSON.parse(claimed.fields) as string[]
-      const record = Object.fromEntries(fields.map(field => [field, property[field]]))
+      const record = Object.fromEntries(fields.map(field => [field, field === 'name' ? property.name ?? propertyLabel(property) : property[field as keyof Property]]))
       const requester = claimed.requested_by ?? null
       const consent = await env.DB.prepare("SELECT r.rule_json FROM properties p LEFT JOIN ai_rules r ON r.property_id=p.id WHERE p.id=? AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor')) AND (? IS NULL OR ? IN ('system:scheduler','system:ai-executor') OR p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))")
         .bind(claimed.property_id, claimed.owner_id, claimed.owner_id, requester, requester, requester, requester).first<{ rule_json: string | null }>()
