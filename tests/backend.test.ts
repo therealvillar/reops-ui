@@ -556,7 +556,7 @@ test('metadata-only reminder edits do not overwrite concurrent cancellation/comp
   const originalFetch = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
   try {
-    async function raceMetadataPatch(state: 'cancelled' | 'completed', patch: { title: string } | { dueAt: string; timeZone: string }) {
+    async function raceMetadataPatch(concurrentPatch: { state: 'cancelled' | 'completed' } | { dueAt: string; timeZone: string }, patch: { title: string } | { dueAt: string; timeZone: string }) {
       let resume!: () => void, selected!: () => void
       const resumePatch = new Promise<void>(resolve => { resume = resolve })
       const reminderSelected = new Promise<void>(resolve => { selected = resolve })
@@ -606,21 +606,30 @@ test('metadata-only reminder edits do not overwrite concurrent cancellation/comp
       }
 
       const metadataPatch = patchReminder(patch)
+      let expectedState: Reminder['state'] | undefined
       try {
         await reminderSelected
-        const terminal = await patchReminder({ state })
-        assert.equal(terminal.status, 200)
-        assert.equal(terminal.data.state, state)
+        const concurrent = await patchReminder(concurrentPatch)
+        assert.equal(concurrent.status, 200)
+        if ('state' in concurrentPatch) assert.equal(concurrent.data.state, concurrentPatch.state)
+        else assert.equal(concurrent.data.dueAt, '2030-02-01T10:30:00.000Z')
+        expectedState = concurrent.data.state
       } finally {
         resume()
       }
       const edited = await metadataPatch
       assert.equal(edited.status, 200)
-      assert.equal(edited.data.state, state)
+      assert.equal(edited.data.state, expectedState)
+      if (!('state' in concurrentPatch)) {
+        assert.equal(edited.data.title, 'Title edit under race')
+        assert.equal(edited.data.dueAt, '2030-02-01T10:30:00.000Z')
+        assert.equal(edited.data.timeZone, 'America/Los_Angeles')
+      }
     }
 
-    await raceMetadataPatch('cancelled', { title: 'Title edit under race' })
-    await raceMetadataPatch('completed', { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' })
+    await raceMetadataPatch({ state: 'cancelled' }, { title: 'Title edit under race' })
+    await raceMetadataPatch({ state: 'completed' }, { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' })
+    await raceMetadataPatch({ dueAt: '2030-02-01T10:30:00Z', timeZone: 'America/Los_Angeles' }, { title: 'Title edit under race' })
   } finally {
     globalThis.fetch = originalFetch
   }
