@@ -17,10 +17,11 @@ function addressParts(value: unknown): AddressParts | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const raw = value as Record<string, unknown>
   const result: AddressParts = {}
-  if (typeof raw.fromAddress === 'string' && raw.fromAddress === raw.toAddress && raw.fromAddress.trim())
-    result.houseNumber = raw.fromAddress.trim().slice(0, 40)
+  const houseNumber = raw.houseNumber ?? (raw.fromAddress === raw.toAddress ? raw.fromAddress : undefined)
+  if (typeof houseNumber === 'string' && houseNumber.trim())
+    result.houseNumber = houseNumber.trim().slice(0, 40)
   for (const [source, target] of Object.entries(componentFields)) {
-    const part = raw[source]
+    const part = raw[source] ?? raw[target]
     if (typeof part === 'string' && part.trim()) result[target as keyof AddressParts] = part.trim().slice(0, 100)
   }
   return Object.keys(result).length ? result : null
