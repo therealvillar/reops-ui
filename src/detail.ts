@@ -86,13 +86,13 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US address, city, state, and ZIP, then select a Census match. Drafts can be saved without a location.')
   status.setAttribute('role', 'status')
   let token: string | undefined
-  let selectedAddress: string | undefined
+  let selectedQuery: string | undefined
   let sequence = 0
   let timer: ReturnType<typeof setTimeout>
-  const choose = (candidate: AddressCandidate) => {
+  const choose = (candidate: AddressCandidate, query: string) => {
     clearTimeout(timer)
     ++sequence
-    selectedAddress = address.value
+    selectedQuery = query
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
@@ -100,7 +100,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
     address.focus()
   }
   address.addEventListener('input', () => {
-    token = undefined; selectedAddress = undefined
+    token = undefined; selectedQuery = undefined
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
     clearTimeout(timer)
@@ -114,7 +114,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
         if (current !== sequence || !address.isConnected) return
         status.textContent = result.message
         for (const candidate of result.candidates) {
-          const option = button(candidate.label, () => choose(candidate), 'address-option')
+          const option = button(candidate.label, () => choose(candidate, query), 'address-option')
           option.setAttribute('role', 'option')
           option.setAttribute('aria-selected', 'false')
           option.addEventListener('keydown', event => {
@@ -144,7 +144,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
       tags: [...new Set(tags.value.split(',').map(t => t.trim()).filter(Boolean))], attributes: attrs.value(),
     }
     if (property) body.version = property.version
-    if (token && selectedAddress === address.value) body.addressToken = token
+    if (token && selectedQuery === address.value) body.addressToken = token
     await save(body)
   })
   return form

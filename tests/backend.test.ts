@@ -331,7 +331,10 @@ test('Census cache reuses conservatively normalized queries and canonical single
   const selected = await createProperty('Normalized cache hit', { enteredAddress: query, addressToken: cached.data.candidates[0].token })
   assert.equal(selected.enteredAddress, query)
   assert.equal(selected.verificationStatus, 'verified')
-  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, name: 'Unrelated edit preserves selected whitespace query' })
+  const selectedAgain = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, addressToken: cached.data.candidates[0].token })
+  assert.equal(selectedAgain.status, 200)
+  assert.equal(selectedAgain.data.enteredAddress, query)
+  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selectedAgain.data.version, name: 'Unrelated edit preserves selected whitespace query' })
   assert.equal(edited.status, 200)
   assert.equal(edited.data.enteredAddress, query)
   assert.equal(edited.data.verificationStatus, 'verified')
@@ -359,6 +362,27 @@ test('Census cache reuses conservatively normalized queries and canonical single
     assert.equal(censusCalls.at(-1), distinct)
   }
   assert.equal(censusCalls.length, afterSingle + 4)
+})
+
+test('partial reminder edits cannot restore a concurrently cancelled or completed reminder', async () => {
+  const p = await createProperty('Concurrent reminder edits')
+  for (const state of ['cancelled', 'completed'] as const) {
+    const reminder = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', {
+      title: 'Original title', dueAt: '2030-01-01T10:00:00Z', timeZone: 'UTC',
+    })
+    assert.equal(reminder.status, 201)
+    const [titleEdit, stateEdit] = await Promise.all([
+      api<Reminder>(`properties/${p.id}/reminders/${reminder.data.id}`, 'PATCH', { title: 'Updated title' }),
+      api<Reminder>(`properties/${p.id}/reminders/${reminder.data.id}`, 'PATCH', { state }),
+    ])
+    assert.equal(titleEdit.status, 200)
+    assert.equal(stateEdit.status, 200)
+    const result = await api<Detail>(`properties/${p.id}`)
+    const updatedReminder = result.data.reminders.find(item => item.id === reminder.data.id)!
+    assert.equal(updatedReminder.title, 'Updated title')
+    assert.equal(updatedReminder.state, state)
+    assert.equal((await api<Notification[]>('notifications')).data.some(item => item.reminderId === reminder.data.id), false)
+  }
 })
 
 test('Census no/invalid matches and provider failures never become successful cache entries; drafts remain available', async () => {

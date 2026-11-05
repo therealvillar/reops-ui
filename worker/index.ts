@@ -187,19 +187,26 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           assert(old, 'Reminder not found', 404)
           const b = await body(request); keys(b, ['title', 'dueAt', 'timeZone', 'state'])
           assert(Object.keys(b).length > 0, 'Include at least one reminder field')
-          if (b.title !== undefined) old.title = text(b.title, 'reminder title', 500)
-          if (b.dueAt !== undefined) old.due_at = dueAt(b.dueAt)
-          if (b.timeZone !== undefined) old.time_zone = timeZone(b.timeZone)
+          const assignments: string[] = []
+          const values: unknown[] = []
+          if (b.title !== undefined) { assignments.push('title=?'); values.push(text(b.title, 'reminder title', 500)) }
+          if (b.dueAt !== undefined) { assignments.push('due_at=?'); values.push(dueAt(b.dueAt)) }
+          if (b.timeZone !== undefined) { assignments.push('time_zone=?'); values.push(timeZone(b.timeZone)) }
           if (b.state !== undefined) {
             assert(['completed', 'cancelled', 'scheduled'].includes(b.state as string), 'Only scheduled, completed, or cancelled can be selected; delivery is server-controlled')
             assert(!(old.state === 'delivered' && b.state === 'scheduled'), 'Create a new reminder to schedule another delivery', 409)
             const delivered = await env.DB.prepare('SELECT id FROM notifications WHERE reminder_id=?').bind(subId).first()
             assert(!(delivered && b.state === 'scheduled'), 'Create a new reminder to schedule another delivery', 409)
-            old.state = b.state as Reminder['state']
+            assignments.push('state=?', 'error=NULL')
+            values.push(b.state)
           }
-          const updated = await env.DB.prepare("UPDATE reminders SET title=?,due_at=?,time_zone=?,state=CASE WHEN state='delivered' AND ?='scheduled' THEN state ELSE ? END,error=NULL,updated_by=? WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))) RETURNING *")
-            .bind(old.title, old.due_at, old.time_zone, old.state, old.state, user.id, subId, id, user.id, user.id).first<ReminderRow>()
-          assert(updated, 'Property access changed; reload', 403)
+          assignments.push('updated_by=?')
+          values.push(user.id, subId, id, user.id, user.id)
+          const stateGuard = b.state === undefined ? '' : ' AND state=?'
+          if (b.state !== undefined) values.push(old.state)
+          const updated = await env.DB.prepare(`UPDATE reminders SET ${assignments.join(',')} WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor')))${stateGuard} RETURNING *`)
+            .bind(...values).first<ReminderRow>()
+          assert(updated, b.state === undefined ? 'Property access changed; reload' : 'Reminder state changed. Reload before saving.', b.state === undefined ? 403 : 409)
           return response(reminderModel(updated))
         }
       }
