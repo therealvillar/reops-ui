@@ -1,8 +1,11 @@
 import type { AIRule, Bin, Detail, Layer, LayerFeature, Note, Property, Reminder, User } from '../shared/types'
+import { propertyLabel } from '../shared/property'
 import { authenticate, protectOrigin } from './auth'
-import { addressSelection, backfillAddresses, savedAddress, searchAddress } from './address'
+import { addressSelection, backfillAddresses, geocodeAddress, savedAddress, searchAddress } from './address'
 import { propertyArea } from './area'
 import { enqueueManual, jobModel, processJobs, requireAI, scheduledWork, type JobRow } from './ai'
+import { enqueueRefresh, enrichmentSources, jobInsert, processEnrichmentJobs, propertyEnrichment, scheduleEnrichment } from './enrichment'
+import { tileConfig } from './tile'
 import { aiFields, assert, attributes, color, DEFAULT_VIEW, dueAt, HttpError, keys, object, rule, savedView, strings, text, timeZone } from './validation'
 
 export interface Env {
@@ -18,6 +21,11 @@ export interface Env {
   DELAWARE_ZONING_ENABLED?: string
   AI_ENDPOINT?: string
   AI_API_KEY?: string
+  MAPTILER_BROWSER_KEY?: string
+  MAP_TILE_URL?: string
+  MAP_TILE_MAX_ZOOM?: string
+  MAP_TILE_ATTRIBUTION?: string
+  PHILADELPHIA_OPA_ENABLED?: string
 }
 interface PropertyRow { id: string; owner_id: string; version: number; data: string }
 interface ReminderRow {
@@ -26,7 +34,7 @@ interface ReminderRow {
 }
 const propertyModel = (row: PropertyRow) => JSON.parse(row.data) as Property
 const reminderModel = (r: ReminderRow): Reminder => ({ id: r.id, propertyId: r.property_id, title: r.title, dueAt: r.due_at, timeZone: r.time_zone, state: r.state, error: r.error, createdBy: r.created_by })
-const propertyLayer: Layer = { id: 'properties', name: 'Properties', color: '#2563eb', source: 'properties', latitudeField: 'latitude', longitudeField: 'longitude', labelField: 'name', filterableAttributes: ['binId', 'tags', 'verificationStatus'] }
+const propertyLayer: Layer = { id: 'properties', name: 'Properties', color: '#2563eb', source: 'properties', latitudeField: 'latitude', longitudeField: 'longitude', labelField: 'displayAddress', filterableAttributes: ['binId', 'tags', 'verificationStatus'] }
 const response = (body: unknown, status = 200) => Response.json(body, { status })
 async function body(request: Request) {
   assert(Number(request.headers.get('Content-Length') ?? 0) <= 100000, 'Request body too large', 413)
@@ -65,15 +73,29 @@ async function listLayers(env: Env, user: User): Promise<Layer[]> {
 }
 async function detail(env: Env, user: User, property: Property): Promise<Detail> {
   const id = property.id
-  const [notes, history, reminders, jobs, aiRule] = await Promise.all([
+  const [notes, history, reminders, jobs, aiRule, enrichment] = await Promise.all([
     env.DB.prepare('SELECT id,body,actor_id AS actorId,actor_name AS actorName,actor_stamp AS actorStamp,created_at AS createdAt FROM notes WHERE property_id=? ORDER BY created_at,id').bind(id).all<Note>(),
     env.DB.prepare('SELECT id,actor_id AS actorId,actor_name AS actorName,actor_stamp AS actorStamp,action,created_at AS createdAt,before_data,after_data FROM property_history WHERE property_id=? ORDER BY created_at,id').bind(id).all<{ id: string; actorId: string; actorName: string; actorStamp: string; action: string; createdAt: string; before_data: string | null; after_data: string }>(),
     env.DB.prepare('SELECT * FROM reminders WHERE property_id=? ORDER BY due_at').bind(id).all<ReminderRow>(),
     env.DB.prepare('SELECT * FROM ai_jobs WHERE property_id=? ORDER BY created_at DESC').bind(id).all<JobRow>(),
     env.DB.prepare('SELECT rule_json FROM ai_rules WHERE property_id=?').bind(id).first<{ rule_json: string }>(),
+    propertyEnrichment(env, property),
   ])
   return { property, notes: notes.results, history: history.results.map(({ before_data, after_data, ...h }) => ({ ...h, before: before_data ? JSON.parse(before_data) : null, after: JSON.parse(after_data) })),
-    reminders: reminders.results.map(reminderModel), aiJobs: jobs.results.map(jobModel), aiRule: aiRule ? JSON.parse(aiRule.rule_json) : null }
+    reminders: reminders.results.map(reminderModel), aiJobs: jobs.results.map(jobModel), aiRule: aiRule ? JSON.parse(aiRule.rule_json) : null,
+    enrichmentSources: enrichmentSources(env), ...enrichment }
+}
+async function requestHash(value: Record<string, unknown>): Promise<string> {
+  const { idempotencyKey: _, ...payload } = value
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(payload)))
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+async function creationByKey(env: Env, user: User, key: string, hash: string): Promise<Property | null> {
+  const previous = await env.DB.prepare('SELECT id,owner_id,version,data,create_hash FROM properties WHERE owner_id=? AND create_key=?')
+    .bind(user.id, key).first<PropertyRow & { create_hash: string | null }>()
+  if (!previous) return null
+  assert(previous.create_hash === hash, 'Idempotency key was already used for a different property request', 409)
+  return propertyModel(previous)
 }
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
@@ -88,6 +110,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   const [resource, id, sub, subId, action] = parts
   const method = request.method
   if (resource === 'me' && parts.length === 1 && method === 'GET') return response(user)
+  if (resource === 'map' && id === 'config' && parts.length === 2 && method === 'GET') return response(tileConfig(env))
   if (resource === 'bins' && !sub) {
     if (!id && method === 'GET') return response((await env.DB.prepare('SELECT id,name,color,position FROM bins WHERE owner_id=? ORDER BY position,id').bind(user.id).all<Bin>()).results)
     if (!id && method === 'POST') {
@@ -112,20 +135,55 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (resource === 'properties') {
     if (!id && method === 'GET') return response((await env.DB.prepare('SELECT p.id,p.owner_id,p.version,p.data FROM properties p WHERE p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?) ORDER BY p.created_at DESC,p.id').bind(user.id, user.id).all<PropertyRow>()).results.map(propertyModel))
     if (!id && method === 'POST') {
-      const b = await body(request); keys(b, ['name', 'enteredAddress', 'binId', 'tags', 'attributes', 'addressToken'])
+      const b = await body(request); keys(b, ['name', 'enteredAddress', 'binId', 'tags', 'attributes', 'addressToken', 'unlocatedDraft', 'allowDuplicate', 'idempotencyKey'])
+      assert(b.unlocatedDraft === undefined || b.unlocatedDraft === true, 'unlocatedDraft must be true when provided')
+      assert(b.allowDuplicate === undefined || b.allowDuplicate === true, 'allowDuplicate must be true when provided')
+      const key = b.idempotencyKey === undefined ? null : text(b.idempotencyKey, 'idempotencyKey', 100)
+      const hash = key ? await requestHash(b) : null
+      if (key) {
+        const previous = await creationByKey(env, user, key, hash!)
+        if (previous) return response(previous)
+      }
       const enteredAddress = text(b.enteredAddress, 'enteredAddress', 1000, true)
-      const selected = b.addressToken === undefined ? await savedAddress(env, enteredAddress) : await addressSelection(env, user, enteredAddress, b.addressToken)
+      const selected = b.addressToken === undefined
+        ? b.unlocatedDraft ? await savedAddress(env, enteredAddress) : await geocodeAddress(env, enteredAddress)
+        : await addressSelection(env, user, enteredAddress, b.addressToken)
+      assert(b.unlocatedDraft === true || selected.verificationStatus === 'verified',
+        `${selected.verificationMessage ?? 'A selected Census match is required'}. Select a match or explicitly create an unlocated draft.`, 422)
+      if (!b.allowDuplicate && enteredAddress.trim()) {
+        const duplicate = await env.DB.prepare("SELECT p.id FROM properties p WHERE (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?)) AND (UPPER(TRIM(json_extract(p.data,'$.enteredAddress')))=UPPER(TRIM(?)) OR (? IS NOT NULL AND UPPER(TRIM(json_extract(p.data,'$.normalizedAddress')))=UPPER(TRIM(?)))) LIMIT 1")
+          .bind(user.id, user.id, enteredAddress, selected.normalizedAddress, selected.normalizedAddress).first<{ id: string }>()
+        if (duplicate && key) {
+          const previous = await creationByKey(env, user, key, hash!)
+          if (previous) return response(previous)
+        }
+        assert(!duplicate, `A property at this address is already in your accessible portfolio (${duplicate?.id}). Check it before creating another, or explicitly allow a separate record.`, 409)
+      }
       const now = new Date().toISOString()
-      const p: Property = { id: crypto.randomUUID(), name: text(b.name, 'name'), enteredAddress, ...selected, binId: await ownedBin(env, user, b.binId),
+      const p: Property = { id: crypto.randomUUID(), ...(b.name === undefined ? {} : { name: text(b.name, 'legacy name') }), enteredAddress, ...selected, binId: await ownedBin(env, user, b.binId),
         tags: strings(b.tags ?? [], 'tags'), attributes: attributes(b.attributes ?? {}), creatorId: user.id, creatorStamp: user.stamp, creatorName: user.name,
         createdAt: now, updatedBy: user.id, updatedAt: now, version: 1 }
-      await env.DB.prepare('INSERT INTO properties(id,owner_id,bin_id,creator_id,created_at,updated_by,updated_at,version,data) VALUES(?,?,?,?,?,?,?,?,?)')
-        .bind(p.id, user.id, p.binId, user.id, now, user.id, now, 1, JSON.stringify(p)).run()
+      const inserts = [env.DB.prepare('INSERT INTO properties(id,owner_id,bin_id,creator_id,created_at,updated_by,updated_at,version,data,create_key,create_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(p.id, user.id, p.binId, user.id, now, user.id, now, 1, JSON.stringify(p), key, hash)]
+      const job = jobInsert(env, p, user.id, `creation:${p.id}:philadelphia_opa`)
+      if (job) inserts.push(job)
+      try { await env.DB.batch(inserts) }
+      catch (error) {
+        if (key && error instanceof Error && /UNIQUE constraint failed: properties.owner_id, properties.create_key/.test(error.message)) {
+          const previous = await creationByKey(env, user, key, hash!)
+          if (previous) return response(previous)
+        }
+        throw error
+      }
       return response(p, 201)
     }
     if (id) {
       const p = await accessibleProperty(env, user, id, !['GET', 'HEAD'].includes(method))
       if (sub === 'area' && parts.length === 3 && method === 'GET') return response(await propertyArea(p, url.searchParams.get('county'), env))
+      if (sub === 'enrichment' && parts.length === 3 && method === 'POST') {
+        const b = await body(request); keys(b, ['idempotencyKey'])
+        return response(await enqueueRefresh(env, p, user.id, text(b.idempotencyKey, 'idempotencyKey', 100)), 202)
+      }
       if (sub === 'bins' && !subId && method === 'GET') return response((await env.DB.prepare('SELECT id,name,color,position FROM bins WHERE owner_id=? ORDER BY position,id').bind(p.creatorId).all<Bin>()).results)
       if (sub === 'members' && !action) {
         assert(p.creatorId === user.id, 'Only the property owner can manage access', 403)
@@ -160,11 +218,20 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         if (b.tags !== undefined) next.tags = strings(b.tags, 'tags')
         if (b.attributes !== undefined) next.attributes = attributes(b.attributes)
         if (b.addressToken !== undefined) Object.assign(next, await addressSelection(env, user, next.enteredAddress, b.addressToken))
-        else if (next.enteredAddress !== p.enteredAddress || (b.enteredAddress !== undefined && p.verificationStatus !== 'verified'))
-          Object.assign(next, await savedAddress(env, next.enteredAddress))
+        else if (next.enteredAddress !== p.enteredAddress || (b.enteredAddress !== undefined && p.verificationStatus !== 'verified')) {
+          const location = next.enteredAddress !== p.enteredAddress && p.verificationStatus === 'verified'
+            ? await geocodeAddress(env, next.enteredAddress) : await savedAddress(env, next.enteredAddress)
+          assert(p.verificationStatus !== 'verified' || location.verificationStatus === 'verified',
+            'Select a Census candidate before replacing a geocoded address; the previous location was preserved.', 422)
+          Object.assign(next, location)
+        }
         next.version++; next.updatedBy = user.id; next.updatedAt = new Date().toISOString()
-        const updated = await env.DB.prepare("UPDATE properties SET bin_id=?,updated_by=?,updated_at=?,version=?,data=? WHERE id=? AND owner_id=? AND version=? AND (owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=properties.id AND m.user_id=? AND m.role='editor')) RETURNING id,owner_id,version,data")
-          .bind(next.binId, user.id, next.updatedAt, next.version, JSON.stringify(next), id, p.creatorId, b.version, user.id, user.id).first<PropertyRow>()
+        const statement = env.DB.prepare("UPDATE properties SET bin_id=?,updated_by=?,updated_at=?,version=?,data=? WHERE id=? AND owner_id=? AND version=? AND (owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=properties.id AND m.user_id=? AND m.role='editor')) RETURNING id,owner_id,version,data")
+          .bind(next.binId, user.id, next.updatedAt, next.version, JSON.stringify(next), id, p.creatorId, b.version, user.id, user.id)
+        const job = next.normalizedAddress !== p.normalizedAddress ? jobInsert(env, next, user.id, `address:${id}:${next.version}`, { afterUpdate: true }) : null
+        const updated = job
+          ? (await env.DB.batch([statement, job]))[0].results[0] as PropertyRow | undefined
+          : await statement.first<PropertyRow>()
         assert(updated, 'Property changed. Reload before saving.', 409)
         return response(propertyModel(updated))
       }
@@ -247,7 +314,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (resource === 'view' && parts.length === 1) {
     if (method === 'GET') {
       const row = await env.DB.prepare('SELECT view_json FROM preferences WHERE owner_id=?').bind(user.id).first<{ view_json: string | null }>()
-      return response(row?.view_json ? JSON.parse(row.view_json) : DEFAULT_VIEW)
+      if (!row?.view_json) return response(DEFAULT_VIEW)
+      try { return response(savedView(JSON.parse(row.view_json))) }
+      catch { throw new HttpError(409, 'Saved view is invalid or from an older version. The default view is shown; save it to replace the old preference.') }
     }
     if (method === 'PUT') {
       const v = savedView(await body(request)), available = await listLayers(env, user)
@@ -264,7 +333,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (resource === 'ai-default-rule' && parts.length === 1) {
     if (method === 'GET') {
       const row = await env.DB.prepare('SELECT default_ai_rule FROM preferences WHERE owner_id=?').bind(user.id).first<{ default_ai_rule: string | null }>()
-      return response(row?.default_ai_rule ? JSON.parse(row.default_ai_rule) : { enabled: false, triggers: ['creation'], watchedFields: [], fields: ['name', 'enteredAddress'] } satisfies AIRule)
+      return response(row?.default_ai_rule ? JSON.parse(row.default_ai_rule) : { enabled: false, triggers: ['creation'], watchedFields: [], fields: ['enteredAddress'] } satisfies AIRule)
     }
     if (method === 'PUT') {
       const r = rule(await body(request))
@@ -296,8 +365,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (id && sub === 'features' && parts.length === 3 && method === 'GET') {
       if (id === 'properties') {
         const props = (await env.DB.prepare('SELECT p.id,p.owner_id,p.version,p.data FROM properties p WHERE p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?)').bind(user.id, user.id).all<PropertyRow>()).results.map(propertyModel)
-        return response(props.filter(p => p.verificationStatus === 'verified' && p.latitude !== null && p.longitude !== null).map(p => ({
-          id: p.id, propertyId: p.id, label: p.name, latitude: p.latitude!, longitude: p.longitude!,
+        return response(props.filter(p => p.verificationStatus === 'verified' && p.latitude !== null && p.longitude !== null &&
+          Number.isFinite(p.latitude) && Number.isFinite(p.longitude) && Math.abs(p.latitude) <= 90 && Math.abs(p.longitude) <= 180).map(p => ({
+          id: p.id, propertyId: p.id, label: propertyLabel(p), latitude: p.latitude!, longitude: p.longitude!,
           attributes: { ...p.attributes, binId: p.binId, tags: p.tags.join(', '), verificationStatus: p.verificationStatus },
         } satisfies LayerFeature)))
       }
@@ -318,28 +388,37 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
   throw new HttpError(404, 'API route not found')
 }
-function secureHeaders(res: Response): Response {
+function secureHeaders(res: Response, env: Env): Response {
   const result = new Response(res.body, res)
   result.headers.set('X-Content-Type-Options', 'nosniff')
-  result.headers.set('Referrer-Policy', 'same-origin')
+  result.headers.set('Referrer-Policy', env.MAPTILER_BROWSER_KEY ? 'strict-origin-when-cross-origin' : 'same-origin')
   result.headers.set('X-Frame-Options', 'DENY')
   result.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
-  result.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.tile.openstreetmap.org; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+  result.headers.set('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:${env.MAPTILER_BROWSER_KEY ? ' https://api.maptiler.com' : ''}; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'`)
   result.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
   result.headers.set('Cache-Control', 'no-store')
   return result
 }
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    try { return secureHeaders(await route(request, env, ctx)) } catch (error) {
-      if (error instanceof HttpError) return secureHeaders(response({ error: error.message }, error.status))
-      if (error instanceof URIError) return secureHeaders(response({ error: 'Malformed path' }, 400))
-      if (error instanceof Error && /UNIQUE constraint failed: bins/.test(error.message)) return secureHeaders(response({ error: 'A bin with this name already exists' }, 409))
+    try { return secureHeaders(await route(request, env, ctx), env) } catch (error) {
+      if (error instanceof HttpError) return secureHeaders(response({ error: error.message }, error.status), env)
+      if (error instanceof URIError) return secureHeaders(response({ error: 'Malformed path' }, 400), env)
+      if (error instanceof Error && /UNIQUE constraint failed: bins/.test(error.message)) return secureHeaders(response({ error: 'A bin with this name already exists' }, 409), env)
       // Never include database/provider errors or credentials in responses or logs.
-      return secureHeaders(response({ error: 'Internal service error' }, 500))
+      return secureHeaders(response({ error: 'Internal service error' }, 500), env)
     }
   },
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil((async () => { await scheduledWork(env); await backfillAddresses(env) })())
+    ctx.waitUntil((async () => {
+      const results = await Promise.allSettled([
+        scheduledWork(env),
+        backfillAddresses(env),
+        (async () => { await scheduleEnrichment(env); await processEnrichmentJobs(env) })(),
+      ])
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failures.length > 1) throw new AggregateError(failures.map(result => result.reason), 'Multiple scheduled tasks failed')
+      if (failures.length) throw failures[0].reason
+    })())
   },
 }

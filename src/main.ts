@@ -1,8 +1,9 @@
-import type { Bin, Layer, LayerFeature, Notification, Property, SavedView, User } from '../shared/types'
+import type { Bin, Layer, LayerFeature, Notification, Property, SavedView, TileConfig, User } from '../shared/types'
+import { propertyLabel } from '../shared/property'
 import { announce, api, ApiError, button, dialog, el, errorMessage, input, label, select, submitForm } from './dom'
 import { createProperty, openProperty } from './detail'
 import { PropertyMap } from './map'
-import { defaultView, displayValue, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, moveProperty, propertyBinChoices, propertyLayerVisible, verificationStatusLabel } from './utils'
+import { defaultView, displayValue, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, moveProperty, propertyBinChoices, propertyLayerVisible, restoreSavedView, verificationStatusLabel } from './utils'
 import './style.css'
 
 type Mode = 'map' | 'table' | 'board'
@@ -14,6 +15,7 @@ let notifications: Notification[] = []
 let view: SavedView = structuredClone(defaultView)
 let mode: Mode = 'map'
 let map: PropertyMap | undefined
+let tileConfig: TileConfig | string = 'MapTiler is not configured'
 const features = new Map<string, LayerFeature[]>()
 const layerErrors = new Map<string, string>()
 const layerLoading = new Set<string>()
@@ -115,8 +117,10 @@ async function initialize(): Promise<void> {
     let savedError: unknown
     try {
       const saved = await api<SavedView>('/view')
-      if (saved) view = { ...structuredClone(defaultView), ...saved, filters: { ...defaultView.filters, ...saved.filters } }
+      view = restoreSavedView(saved)
     } catch (error) { savedError = error }
+    try { tileConfig = await api<TileConfig>('/map/config') }
+    catch (error) { tileConfig = errorMessage(error) }
     buildShell()
     renderContent()
     loadSharedBins()
@@ -277,7 +281,7 @@ function renderContent(): void {
   mapLegend.hidden = mode !== 'map'
   if (mode === 'map') {
     renderLegend()
-    if (!map) { content.replaceChildren(); content.className = 'view-content map-view'; map = new PropertyMap(content, id => { void open(id) }) }
+    if (!map) { content.replaceChildren(); content.className = 'view-content map-view'; map = new PropertyMap(content, id => { void open(id) }, tileConfig) }
     const pointCount = map.update(filtered, catalogBins(), layers, features, view)
     content.querySelector('.map-empty')?.remove()
     if (!pointCount) {
@@ -285,10 +289,12 @@ function renderContent(): void {
       const hasReferenceLocations = view.layers.some(id => id !== 'properties' && (features.get(id)?.length ?? 0) > 0)
       const hiddenProperties = !propertyLayerVisible(view) && filtered.some(isMappable)
       empty.append(el('strong', '', hiddenProperties ? 'Property layer is hidden' : hasReferenceLocations ? 'No locations match this view' : 'No locations to plot yet'), el('p', '', hiddenProperties
-        ? 'Enable Properties in the map legend to show these locations, or choose a reference layer.'
+        ? 'Show Properties to display these locations, or choose a reference layer.'
         : hasReferenceLocations
         ? 'Reference locations are hidden by the active filters. Clear filters or enable a compatible layer. Unlocated drafts remain available in Table and Board.'
-        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Add a complete address or select a Census match in the dossier to locate a property.' : 'Add a property or clear filters to start exploring.'), button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
+        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Add a complete address or select a Census match in the dossier to locate a property.' : 'Add a property or clear filters to start exploring.'),
+        ...(hiddenProperties ? [button('Show Properties', () => { view.layers = [...new Set([...view.layers, 'properties'])]; renderContent() }, 'button small')] : []),
+        button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
       content.append(empty)
     }
   } else {
@@ -308,9 +314,9 @@ function renderContent(): void {
 function renderTable(records: Property[]): void {
   const scroller = el('div', 'table-scroll')
   const table = el('table', 'property-table')
-  const caption = el('caption', 'sr-only', 'Properties. Select a property name to open its dossier. Column header buttons sort; Shift-click adds another sort.')
+  const caption = el('caption', 'sr-only', 'Properties. Select an address to open its dossier. Column header buttons sort; Shift-click adds another sort.')
   const head = el('thead'); const row = el('tr')
-  const columns = view.columns.length ? view.columns : ['name']
+  const columns = view.columns.length ? view.columns : ['displayAddress']
   for (const field of columns) {
     const th = el('th'); th.scope = 'col'
     const sortIndex = view.sorts.findIndex(s => s.field === field)
@@ -334,8 +340,8 @@ function renderTable(records: Property[]): void {
       const td = el('td')
       const matchingBin = catalogBins().find(b => b.id === property.binId)
       const value = field === 'binId' ? matchingBin ? binName(matchingBin) : property.binId : fieldValue(property, field)
-      if (field === 'name') {
-        const openName = button(property.name, () => open(property.id), 'property-name'); openName.dataset.propertyId = property.id; td.append(openName)
+      if (field === 'name' || field === 'displayAddress') {
+        const openName = button(propertyLabel(property), () => open(property.id), 'property-name'); openName.dataset.propertyId = property.id; td.append(openName)
       }
       else if (field === 'verificationStatus') td.append(el('span', `badge ${property.verificationStatus}`, verificationStatusLabel(property.verificationStatus)))
       else if (field === 'binId') {
@@ -347,7 +353,7 @@ function renderTable(records: Property[]): void {
       tr.append(td)
     }
     const openCell = el('td')
-    const openButton = button('↗', () => open(property.id), 'icon-button'); openButton.setAttribute('aria-label', `Open ${property.name} dossier`)
+    const openButton = button('↗', () => open(property.id), 'icon-button'); openButton.setAttribute('aria-label', `Open ${propertyLabel(property)} dossier`)
     openButton.dataset.propertyId = property.id
     openCell.append(openButton); tr.append(openCell); body.append(tr)
   }
@@ -376,15 +382,15 @@ function renderBoard(records: Property[]): void {
       card.addEventListener('dragend', () => board.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over')))
       const cardHeader = el('div', 'card-top')
       cardHeader.append(el('span', 'eyebrow', 'PROPERTY'), el('span', 'drag-handle', '⠿'))
-      const openName = button(property.name, () => open(property.id), 'property-name'); openName.dataset.propertyId = property.id
-      card.append(cardHeader, openName, el('p', 'muted card-address', property.enteredAddress))
+      const openName = button(propertyLabel(property), () => open(property.id), 'property-name'); openName.dataset.propertyId = property.id
+      card.append(cardHeader, openName, ...(property.normalizedAddress && property.normalizedAddress !== property.enteredAddress ? [el('p', 'muted card-address', `Entered: ${property.enteredAddress}`)] : []))
       const tags = el('div', 'tags'); property.tags.forEach(tag => tags.append(el('span', 'tag', tag)))
       const foot = el('div', 'card-foot')
       const stamp = el('span', 'stamp small-stamp', property.creatorStamp); stamp.title = property.creatorName
       foot.append(stamp, el('span', `badge ${property.verificationStatus}`, verificationStatusLabel(property.verificationStatus)))
       const move = select('moveBin', recordBins(property).map(b => ({ value: b.id, label: b.name })), property.binId); move.disabled = moving.has(property.id)
       move.dataset.propertyId = property.id
-      move.setAttribute('aria-label', `Move ${property.name} to bin`)
+      move.setAttribute('aria-label', `Move ${propertyLabel(property)} to bin`)
       move.addEventListener('change', () => { void changeBin(property.id, move.value) })
       card.append(tags, foot, label(moving.has(property.id) ? 'Moving…' : 'Move to bin', move))
       column.append(card)
@@ -403,11 +409,11 @@ async function changeBin(id: string, binId: string): Promise<void> {
     return
   }
   moving.add(id); properties = moveProperty(properties, id, binId); renderContent()
-  announce(`Moving ${original.name} to ${recordBins(original).find(b => b.id === binId)!.name}.`)
+  announce(`Moving ${propertyLabel(original)} to ${recordBins(original).find(b => b.id === binId)!.name}.`)
   try {
     const updated = await api<Property>(`/properties/${encodeURIComponent(id)}`, 'PATCH', { version: original.version, binId })
     const index = properties.findIndex(p => p.id === id); if (index >= 0) properties[index] = updated
-    announce(`${original.name} moved. All other record details preserved.`)
+    announce(`${propertyLabel(original)} moved. All other record details preserved.`)
   } catch (error) {
     const index = properties.findIndex(p => p.id === id); if (index >= 0) properties[index] = original
     showError(error)

@@ -1,4 +1,6 @@
 export type VerificationStatus = 'unverified' | 'verified' | 'ambiguous' | 'failed'
+export type AddressParts = Partial<Record<'houseNumber' | 'predirectional' | 'street' | 'streetSuffix' |
+  'postdirectional' | 'unit' | 'city' | 'state' | 'zip', string>>
 export interface User {
   id: string
   name: string
@@ -6,9 +8,10 @@ export interface User {
 }
 export interface Property {
   id: string
-  name: string
+  name?: string
   enteredAddress: string
   normalizedAddress: string | null
+  addressComponents?: AddressParts | null
   verificationStatus: VerificationStatus
   verificationMessage: string | null
   latitude: number | null
@@ -49,7 +52,32 @@ export interface AIRule {
 export interface Detail {
   property: Property; notes: Note[]; history: Activity[]; reminders: Reminder[]
   aiJobs: AIJob[]; aiRule: AIRule | null
+  enrichmentSources: EnrichmentSource[]
+  enrichment: EnrichmentJob[]
+  sourceRecords: SourceRecord[]
+  sourceAttributes: SourceAttribute[]
 }
+export interface EnrichmentSource {
+  id: string; name: string; dataset: string; url: string; coverage: string
+  enabled: boolean; message: string; refreshDays: number
+  sourceType: 'carto_sql' | 'arcgis'
+  baseUrl: string; identifierFields: string[]; addressFields: string[]; parcelFields: string[]
+  spatialReference: string; retrievalMethod: string; license: string
+  requestLimit: number; timeoutMs: number; mappingRules: string; provenance: string
+}
+export interface EnrichmentJob {
+  id: string; sourceId: string; status: 'pending' | 'running' | 'complete' | 'manual_review' | 'unavailable' | 'failed'
+  attempts: number; lastError: string | null; createdAt: string; completedAt: string | null
+}
+export interface SourceRecord {
+  id: string; sourceId: string; sourceRecordId: string; matchMethod: 'parcel_id' | 'exact_address'
+  matchConfidence: 'exact_parcel' | 'strong_address'; data: Record<string, string | number | boolean | null>
+  fetchedAt: string; sourceUpdatedAt: string | null
+}
+export interface SourceAttribute {
+  key: string; value: string | number | null; sourceId: string; observedAt: string
+}
+export interface TileConfig { url: string; attribution: string; maxZoom: number }
 export interface AddressCandidate {
   token: string; label: string; latitude: number | null; longitude: number | null
   verified: boolean; message: string

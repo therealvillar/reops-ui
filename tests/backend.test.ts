@@ -7,6 +7,7 @@ import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
+import { jobInsert, processEnrichmentJobs, scheduleEnrichment } from '../worker/enrichment'
 import { protectOrigin } from '../worker/auth'
 import worker from '../worker/index'
 import type { Env } from '../worker/index'
@@ -25,6 +26,8 @@ const signingSecret = 'test-only-address-signing-secret-32-characters'
 const censusCalls: string[] = []
 let censusFailures = 0
 let cartoCalls = 0
+let opaCalls: string[] = []
+let opaMode: 'exact' | 'changed' | 'none' | 'ambiguous' | 'invalid' | 'unit' = 'exact'
 
 async function upstream(request: Request): Promise<Response> {
   const url = new URL(request.url)
@@ -57,7 +60,16 @@ async function upstream(request: Request): Promise<Response> {
       { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 } },
     ] } })
     if (query === 'Single match') return Response.json({ result: { addressMatches: [
-      { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 } },
+      { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 },
+        addressComponents: { fromAddress: '456', toAddress: '456', streetName: 'OAK', suffixType: 'ST', city: 'SPRINGFIELD', state: 'NY', zip: '12345' } },
+    ] } })
+    if (query === 'Philadelphia scheduler fixture') return Response.json({ result: { addressMatches: [
+      { matchedAddress: '820 TEST RD, PHILADELPHIA, PA, 19111', coordinates: { x: -75.13, y: 40.04 } },
+    ] } })
+    if (query === 'Philadelphia exact' || query === 'Philadelphia corrected') return Response.json({ result: { addressMatches: [
+      { matchedAddress: `810 SUSQUEHANNA RD, PHILADELPHIA, PA, ${query === 'Philadelphia corrected' ? '19111-9999' : '19111-1342'}`, coordinates: { x: -75.13, y: 40.04 },
+        addressComponents: { fromAddress: '810', toAddress: '810', streetName: 'SUSQUEHANNA', suffixType: 'RD',
+          city: 'PHILADELPHIA', state: 'PA', zip: '19111' } },
     ] } })
     return Response.json({ result: { addressMatches: [
       { matchedAddress: '123 Main St, Springfield', coordinates: { x: -73.2, y: 40.1 } },
@@ -68,7 +80,19 @@ async function upstream(request: Request): Promise<Response> {
   if (url.hostname === 'phl.carto.com') {
     assert.equal(request.method, 'GET')
     assert.equal(url.pathname, '/api/v2/sql')
-    assert.match(url.searchParams.get('q')!, /ST_DWithin.*LIMIT 25$/)
+    const sql = url.searchParams.get('q')!
+    if (/FROM opa_properties_public WHERE (UPPER\(TRIM\(location\)\)|parcel_number=)/.test(sql)) {
+      opaCalls.push(sql)
+      assert.match(sql, /810 SUSQUEHANNA RD|632042200/)
+      assert.doesNotMatch(sql, /ST_DWithin|owner_1|mailing_address/)
+      if (opaMode === 'invalid') return Response.json({ rows: [{ parcel_number: '632042200' }] })
+      if (opaMode === 'none') return Response.json({ rows: [] })
+      const row = { parcel_number: '632042200', location: '810 SUSQUEHANNA RD', zip_code: '19111-1342', unit: opaMode === 'unit' ? '2' : null,
+        market_value: opaMode === 'changed' ? 240000 : 236240, number_of_bedrooms: 3, total_livable_area: 1572,
+        assessment_date: '2026-09-13', owner_1: 'Do not persist this unrequested personal name' }
+      return Response.json({ rows: opaMode === 'ambiguous' ? [row, { ...row, parcel_number: '632042201' }] : [row] })
+    }
+    assert.match(sql, /ST_DWithin.*LIMIT 25$/)
     cartoCalls++
     return Response.json({ rows: [] })
   }
@@ -102,13 +126,14 @@ async function api<T>(path: string, method = 'GET', value?: unknown, who = 'alic
   return { status: res.status, data: await res.json() as T, res: res as unknown as Response }
 }
 async function createProperty(name = 'Draft', extras = {}): Promise<Property> {
-  const result = await api<Property>('properties', 'POST', { name, enteredAddress: '123 Main', binId: bin.id, tags: ['lead'], attributes: { price: 100, active: true }, ...extras })
+  const result = await api<Property>('properties', 'POST', { name, enteredAddress: '123 Main', binId: bin.id, tags: ['lead'], attributes: { price: 100, active: true },
+    unlocatedDraft: true, allowDuplicate: true, ...extras })
   assert.equal(result.status, 201, JSON.stringify(result.data))
   return result.data
 }
-async function applyMigrations(database: { prepare(sql: string): { run(): Promise<unknown> } }) {
+async function applyMigrations(database: { prepare(sql: string): { run(): Promise<unknown> } }, select: (name: string) => boolean = () => true) {
   const directory = new URL('../migrations/', import.meta.url)
-  for (const name of (await readdir(directory)).filter(name => name.endsWith('.sql')).sort()) {
+  for (const name of (await readdir(directory)).filter(name => name.endsWith('.sql') && select(name)).sort()) {
     const migration = await readFile(new URL(name, directory), 'utf8')
     // D1's exec helper splits on newlines; prepared statements preserve multi-line trigger bodies.
     for (const sql of migration.match(/CREATE TRIGGER[\s\S]*?END;|(?:PRAGMA|CREATE TABLE|CREATE INDEX|DROP TRIGGER|ALTER TABLE|INSERT|UPDATE)[\s\S]*?;/g)!) await database.prepare(sql).run()
@@ -172,7 +197,7 @@ test('Access verifies JWTs and isolates owners; cross-origin and forged headers 
   assert.equal((await api(`bins/${bin.id}`, 'PATCH', { name: 'Steal' }, 'bob')).status, 404)
   assert.deepEqual((await api<Property[]>('properties', 'GET', undefined, 'bob')).data, [])
   const bobBin = (await api<Bin[]>('bins', 'GET', undefined, 'bob')).data[0]
-  assert.equal((await api('properties', 'POST', { name: 'No', enteredAddress: '', binId: bobBin.id })).status, 404)
+  assert.equal((await api('properties', 'POST', { name: 'No', enteredAddress: '', unlocatedDraft: true, binId: bobBin.id })).status, 404)
 })
 
 test('Preview mutations allow only same-origin requests on provisioned Preview hostnames', () => {
@@ -343,7 +368,8 @@ test('ambiguous addresses stay unlocated until a signed provider candidate is se
   const bobBins = (await api<Bin[]>('bins', 'GET', undefined, 'bob')).data
   assert.equal((await api('properties', 'POST', { name: 'Borrow token', enteredAddress: '123 Main', binId: bobBins[0].id, addressToken: search.data.candidates[0].token }, 'bob')).status, 400)
   const moved = await api<Property>(`properties/${p.id}`, 'PATCH', { version: 2, enteredAddress: 'Changed' })
-  assert.equal(moved.data.latitude, null); assert.equal(moved.data.verificationStatus, 'ambiguous')
+  assert.equal(moved.status, 422)
+  assert.equal((await api<Detail>(`properties/${p.id}`)).data.property.latitude, 40.1)
   const secondMatch = await createProperty('Selected second Census match', { addressToken: search.data.candidates[1].token })
   assert.equal(secondMatch.verificationStatus, 'verified'); assert.equal(secondMatch.latitude, 41.2)
   assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === secondMatch.id), true)
@@ -396,6 +422,8 @@ test('scheduled work backfills old unlocated properties without changing already
 
 test('scheduled geocoding retries provider outages without saving false coordinates', async () => {
   const draft = await createProperty('Retry old address', { enteredAddress: '' })
+  const philly = await api<Property>('properties', 'POST', { enteredAddress: 'Philadelphia scheduler fixture', binId: bin.id })
+  assert.equal(philly.status, 201)
   await db.prepare("UPDATE properties SET data=json_set(data,'$.enteredAddress',?) WHERE id=?").bind('Retry match', draft.id).run()
   censusFailures = 1
   const originalFetch = globalThis.fetch
@@ -408,6 +436,11 @@ test('scheduled geocoding retries provider outages without saving false coordina
     assert.equal(censusCalls.at(-1), 'Retry match')
     assert.equal((await api<Detail>(`properties/${draft.id}`)).data.property.verificationStatus, 'unverified')
     assert.equal(await db.prepare("SELECT count(*) AS count FROM property_gps WHERE normalized_query='RETRY MATCH'").first('count'), 0)
+    assert.equal((await api<Detail>(`properties/${philly.data.id}`)).data.enrichment[0].status, 'unavailable')
+    await scheduleEnrichment({ ...env, PHILADELPHIA_OPA_ENABLED: 'true' })
+    assert.equal((await api<Detail>(`properties/${philly.data.id}`)).data.enrichment[0].status, 'pending')
+    await processEnrichmentJobs(env)
+    assert.equal((await api<Detail>(`properties/${philly.data.id}`)).data.enrichment[0].status, 'unavailable')
     await worker.scheduled({} as ScheduledController, env, { waitUntil(promise) { work = promise } } as ExecutionContext)
     await work
     const located = (await api<Detail>(`properties/${draft.id}`)).data.property
@@ -472,7 +505,7 @@ test('stale concurrent reminder state changes return a conflict without overwrit
   }
   const localBin = (await localApi<Bin[]>('bins')).data[0]
   const p = (await localApi<Property>('properties', 'POST', {
-    name: 'Concurrent reminder edits', enteredAddress: '123 Main', binId: localBin.id, tags: ['lead'], attributes: { price: 100, active: true },
+    name: 'Concurrent reminder edits', enteredAddress: '123 Main', unlocatedDraft: true, binId: localBin.id, tags: ['lead'], attributes: { price: 100, active: true },
   })).data
   const reminder = await localApi<Reminder>(`properties/${p.id}/reminders`, 'POST', {
     title: 'Original title', dueAt: '2030-01-01T10:00:00Z', timeZone: 'UTC',
@@ -949,6 +982,35 @@ test('AI needs explicit opt-in, creates deduplicated snapshots, never changes re
   } finally { globalThis.fetch = originalFetch }
 })
 
+test('name-only automatic AI consent does not share the address of a property without a legacy name', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  const previousRule = (await api('ai-default-rule')).data
+  try {
+    aiCalls = []
+    const nameOnly = { enabled: true, triggers: ['creation'], watchedFields: [], fields: ['name'] }
+    assert.equal((await api('ai-default-rule', 'PUT', nameOnly)).status, 200)
+    const missingName = await api<Property>('properties', 'POST', { enteredAddress: 'Single match', binId: bin.id, allowDuplicate: true })
+    assert.equal(missingName.status, 201)
+    assert.equal(missingName.data.name, undefined)
+    await processJobs(env)
+    assert.equal(aiCalls.length, 1)
+    assert.deepEqual(aiCalls[0].fields, ['name'])
+    assert.deepEqual(aiCalls[0].record, {})
+
+    assert.equal((await api('ai-default-rule', 'PUT', { ...nameOnly, fields: ['enteredAddress', 'normalizedAddress'] })).status, 200)
+    const authorized = await api<Property>('properties', 'POST', { enteredAddress: 'Single match', binId: bin.id, allowDuplicate: true })
+    assert.equal(authorized.status, 201)
+    await processJobs(env)
+    assert.equal(aiCalls.length, 2)
+    assert.deepEqual(aiCalls[1].fields, ['enteredAddress', 'normalizedAddress'])
+    assert.deepEqual(aiCalls[1].record, { enteredAddress: 'Single match', normalizedAddress: authorized.data.normalizedAddress })
+  } finally {
+    globalThis.fetch = originalFetch
+    await api('ai-default-rule', 'PUT', previousRule)
+  }
+})
+
 test('oversized AI provider streams are cancelled before full buffering or decoding', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
@@ -998,7 +1060,7 @@ test('local development bypass is explicit and impossible on remote requests or 
     const bins = await (await local.dispatchFetch('http://localhost/api/bins')).json() as Bin[]
     const unavailable = await local.dispatchFetch('http://localhost/api/addresses/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"query":"123 Main"}' })
     assert.equal(unavailable.status, 503); assert.match(JSON.stringify(await unavailable.json()), /unverified draft/)
-    const draft = await local.dispatchFetch('http://localhost/api/properties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty address draft', enteredAddress: '', binId: bins[0].id }) })
+    const draft = await local.dispatchFetch('http://localhost/api/properties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty address draft', enteredAddress: '', unlocatedDraft: true, binId: bins[0].id }) })
     assert.equal(draft.status, 201)
     const draftProperty = await draft.json() as Property
     assert.equal(draftProperty.verificationStatus, 'unverified')
@@ -1012,4 +1074,396 @@ test('local development bypass is explicit and impossible on remote requests or 
     await local.setOptions({ ...convertV4MiniflareOptions({ ...localOptions, bindings: { DEV_AUTH: 'true', ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience' } }), resourceTmpPath: `${process.cwd()}/worker/.backend-test-runtime/local` })
     assert.equal((await local.dispatchFetch('http://localhost/api/me')).status, 401)
   } finally { await local.dispose() }
+})
+
+test('licensed map configuration fails clearly when absent and exposes only a browser-scoped key at runtime', async () => {
+  const local = { ...env, DEV_AUTH: 'true', MAPTILER_BROWSER_KEY: 'test-browser-key', MAP_TILE_ATTRIBUTION: '<source>' }
+  const request = new Request('http://127.0.0.1/api/map/config')
+  const missing = await worker.fetch(request, { ...local, MAPTILER_BROWSER_KEY: undefined }, {} as ExecutionContext)
+  assert.equal(missing.status, 503)
+  assert.match(JSON.stringify(await missing.json()), /licensed MapTiler browser key/)
+  const response = await worker.fetch(request, local, {} as ExecutionContext)
+  assert.equal(response.status, 200)
+  const config = await response.json() as { url: string; maxZoom: number; attribution: string }
+  assert.equal(config.url, 'https://api.maptiler.com/maps/streets-v4/{z}/{x}/{y}.png?key=test-browser-key')
+  assert.equal(config.maxZoom, 19)
+  assert.match(config.attribution, /MapTiler.*OpenStreetMap/)
+  assert.match(config.attribution, /&lt;source&gt;/)
+  assert.match(response.headers.get('content-security-policy')!, /img-src 'self' data: https:\/\/api.maptiler.com/)
+  assert.equal(response.headers.get('referrer-policy'), 'strict-origin-when-cross-origin')
+  const invalid = await worker.fetch(request, { ...local, MAP_TILE_URL: 'https://evil.example/{z}/{x}/{y}.png' }, {} as ExecutionContext)
+  assert.equal(invalid.status, 503)
+})
+
+test('additive migration upgrades the original schema without changing property JSON, IDs or history', async () => {
+  const bundle = await build({ entryPoints: ['worker/index.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false })
+  const local = new Miniflare({ ...convertV4MiniflareOptions({
+    modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-11-02', d1Databases: ['DB'],
+  }), resourceTmpPath: `${runtimeDirectory}/upgrade` })
+  try {
+    const database = await local.getD1Database('DB')
+    await applyMigrations(database, name => name < '0007_property_enrichment.sql')
+    const id = crypto.randomUUID(), owner = 'upgrade-user', binId = crypto.randomUUID()
+    const data = JSON.stringify({ id, name: 'Historic label', enteredAddress: '100 Legacy St', binId })
+    const now = new Date().toISOString()
+    await database.prepare('INSERT INTO users(id,name,stamp) VALUES(?,?,?)').bind(owner, 'Test owner', 'TEST-OWNER').run()
+    await database.prepare('INSERT INTO bins(id,owner_id,name,color) VALUES(?,?,?,?)').bind(binId, owner, 'New', '#123456').run()
+    await database.prepare('INSERT INTO properties(id,owner_id,bin_id,creator_id,created_at,updated_by,updated_at,version,data) VALUES(?,?,?,?,?,?,?,?,?)')
+      .bind(id, owner, binId, owner, now, owner, now, 1, data).run()
+    await applyMigrations(database, name => name === '0007_property_enrichment.sql')
+    const preserved = await database.prepare('SELECT owner_id,version,data,create_key,create_hash FROM properties WHERE id=?')
+      .bind(id).first<{ owner_id: string; version: number; data: string; create_key: string | null; create_hash: string | null }>()
+    assert.deepEqual(preserved, { owner_id: owner, version: 1, data, create_key: null, create_hash: null })
+    assert.equal(await database.prepare('SELECT count(*) AS total FROM property_history WHERE property_id=?').bind(id).first('total'), 1)
+    assert.deepEqual((await database.prepare('PRAGMA foreign_key_check').all()).results, [])
+  } finally { await local.dispose() }
+})
+
+test('saved views distinguish missing, invalid legacy and intentionally hidden Properties preferences', async () => {
+  const initial = (await api<SavedView>('view')).data
+  const hidden = { ...initial, layers: [] }
+  try {
+    assert.equal((await api('view', 'PUT', hidden)).status, 200)
+    assert.deepEqual((await api<SavedView>('view')).data.layers, [])
+    await db.prepare('UPDATE preferences SET view_json=? WHERE owner_id=?')
+      .bind(JSON.stringify({ columns: ['name'], sorts: [], filters: initial.filters }), user.id).run()
+    const legacy = await api('view')
+    assert.equal(legacy.status, 409)
+    assert.match(JSON.stringify(legacy.data), /Saved view is invalid/)
+  } finally { await api('view', 'PUT', initial) }
+})
+
+test('standard creation needs a geocode, explicit drafts remain possible, and creation keys prevent duplicate rows', async () => {
+  const input = { enteredAddress: 'Strict draft unique', binId: bin.id, idempotencyKey: 'strict-creation-1' }
+  const ambiguous = await api('properties', 'POST', input)
+  assert.equal(ambiguous.status, 422)
+  assert.match(JSON.stringify(ambiguous.data), /Select a match/)
+  assert.equal((await api('properties', 'POST', { enteredAddress: 'Provider non-OK', binId: bin.id })).status, 502)
+  const draft = await api<Property>('properties', 'POST', { ...input, unlocatedDraft: true })
+  assert.equal(draft.status, 201)
+  assert.equal(draft.data.verificationStatus, 'ambiguous')
+  assert.equal(draft.data.name, undefined)
+  const repeat = await api<Property>('properties', 'POST', { ...input, unlocatedDraft: true })
+  assert.equal(repeat.status, 200)
+  assert.equal(repeat.data.id, draft.data.id)
+  assert.equal((await api('properties', 'POST', { ...input, unlocatedDraft: true, tags: ['changed'] })).status, 409)
+  assert.equal((await api('properties', 'POST', { enteredAddress: 'Strict draft unique', binId: bin.id, unlocatedDraft: true })).status, 409)
+  assert.equal((await api('properties', 'POST', { ...input, unlocatedDraft: true, idempotencyKey: 'strict-creation-2' })).status, 409)
+  assert.equal((await api('properties', 'POST', { enteredAddress: '', binId: bin.id })).status, 422)
+  assert.equal((await api('properties', 'POST', { enteredAddress: '', binId: bin.id, unlocatedDraft: true })).status, 201)
+})
+
+test('creation retries recover by key when the first request commits during geocoding', async () => {
+  const input = { enteredAddress: 'Concurrent creation draft', binId: bin.id, unlocatedDraft: true, idempotencyKey: 'concurrent-creation-1' }
+  let signalGeocoding!: () => void
+  let releaseGeocoding!: () => void
+  const geocoding = new Promise<void>(resolve => { signalGeocoding = resolve })
+  const firstCreated = new Promise<void>(resolve => { releaseGeocoding = resolve })
+  const controlledDB = new Proxy(db, {
+    get(target, property) {
+      if (property !== 'prepare') return Reflect.get(target, property, target)
+      return (query: string) => {
+        const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+          get(targetStatement, member) {
+            if (member === 'bind') return (...values: Parameters<D1PreparedStatement['bind']>) => wrap(targetStatement.bind(...values))
+            if (query.startsWith('SELECT matched_address,latitude,longitude,components FROM property_gps') && member === 'all')
+              return async (...args: never[]) => {
+                signalGeocoding()
+                await firstCreated
+                return targetStatement.all(...args)
+              }
+            const result = Reflect.get(targetStatement, member, targetStatement)
+            return typeof result === 'function' ? result.bind(targetStatement) : result
+          },
+        })
+        return wrap(target.prepare(query))
+      }
+    },
+  }) as D1Database
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((request: RequestInfo | URL, options?: RequestInit) => upstream(new Request(request, options))) as typeof fetch
+  try {
+    const retry = worker.fetch(new Request(`${origin}/api/properties`, {
+      method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': tokens.alice, 'Content-Type': 'application/json', Origin: origin },
+      body: JSON.stringify(input),
+    }), { ...env, DB: controlledDB, ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin },
+    {} as ExecutionContext)
+    await geocoding
+    const created = await api<Property>('properties', 'POST', input)
+    assert.equal(created.status, 201)
+    releaseGeocoding()
+    const replay = await retry
+    assert.equal(replay.status, 200)
+    assert.equal((await replay.json() as Property).id, created.data.id)
+    assert.equal(await db.prepare('SELECT COUNT(*) AS total FROM properties WHERE owner_id=? AND create_key=?')
+      .bind(user.id, input.idempotencyKey).first('total'), 1)
+  } finally {
+    releaseGeocoding()
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('enrichment is durable, source-gated, exact-matched, provenance-preserving and does not change CRM data', async () => {
+  const result = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, attributes: { assessedValue: 1 }, idempotencyKey: 'philly-1',
+  })
+  assert.equal(result.status, 201)
+  const property = result.data
+  assert.equal(property.name, undefined)
+  assert.equal(property.normalizedAddress, '810 SUSQUEHANNA RD, PHILADELPHIA, PA, 19111-1342')
+  assert.deepEqual(property.addressComponents, { houseNumber: '810', street: 'SUSQUEHANNA', streetSuffix: 'RD',
+    city: 'PHILADELPHIA', state: 'PA', zip: '19111' })
+  assert.equal((await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, attributes: { assessedValue: 1 }, idempotencyKey: 'philly-1',
+  })).data.id, property.id)
+  assert.equal((await api('properties', 'POST', { enteredAddress: 'Philadelphia exact', binId: bin.id })).status, 409)
+  assert.equal((await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'unauthorized' }, 'bob')).status, 404)
+  const queued = (await api<Detail>(`properties/${property.id}`)).data
+  assert.equal(queued.enrichment[0].status, 'pending')
+  assert.equal(queued.sourceRecords.length, 0)
+  assert.equal(queued.enrichmentSources.find(s => s.id === 'philadelphia_opa')?.enabled, false)
+  const before = opaCalls.length
+  await processEnrichmentJobs(env)
+  assert.equal(opaCalls.length, before)
+  assert.equal((await api<Detail>(`properties/${property.id}`)).data.enrichment[0].status, 'unavailable')
+  const old = new Date(Date.now() - 11 * 60000).toISOString()
+  await db.prepare('UPDATE property_enrichment_jobs SET created_at=? WHERE property_id=?').bind(old, property.id).run()
+  const refresh = await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'opa-1' })
+  assert.equal(refresh.status, 202)
+  const again = await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'opa-1' })
+  assert.equal(again.status, 202)
+  assert.deepEqual(refresh.data, again.data)
+  assert.equal((await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'opa-2' })).status, 409)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    opaMode = 'exact'
+    await processEnrichmentJobs({ ...env, PHILADELPHIA_OPA_ENABLED: 'true' })
+    const finished = (await api<Detail>(`properties/${property.id}`)).data
+    assert.equal(finished.enrichment[0].status, 'complete')
+    assert.equal(finished.sourceRecords.length, 1)
+    assert.equal(finished.sourceRecords[0].sourceRecordId, '632042200')
+    assert.equal(finished.sourceRecords[0].matchConfidence, 'strong_address')
+    assert.equal(finished.sourceRecords[0].data.owner_1, undefined)
+    assert.equal(finished.sourceAttributes.find(attr => attr.key === 'assessedValue')?.value, 236240)
+    assert.equal(finished.property.attributes.assessedValue, 1)
+    assert.equal(finished.property.version, property.version)
+    assert.equal(finished.history.find(item => item.action === 'enrichment_updated' && (item.after as { status: string }).status === 'complete')?.actorId, 'system:enricher')
+    assert.match(opaCalls.at(-1)!, /UPPER\(TRIM\(location\)\).*LEFT\(zip_code,5\)/)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_identity WHERE property_id=?').bind(property.id).first('total'), 1)
+    await db.prepare('UPDATE property_enrichment_jobs SET created_at=? WHERE id=?').bind(old, (refresh.data as { id: string }).id).run()
+    opaMode = 'changed'
+    assert.equal((await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'opa-2' })).status, 202)
+    await processEnrichmentJobs({ ...env, PHILADELPHIA_OPA_ENABLED: 'true' })
+    const changed = (await api<Detail>(`properties/${property.id}`)).data
+    assert.equal(changed.sourceRecords.length, 1)
+    assert.equal(changed.sourceRecords[0].matchConfidence, 'exact_parcel')
+    assert.equal(changed.sourceAttributes.find(attr => attr.key === 'assessedValue')?.value, 240000)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_source_records WHERE property_id=?').bind(property.id).first('total'), 2)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_source_records WHERE property_id=? AND superseded_at IS NOT NULL').bind(property.id).first('total'), 1)
+    assert.match(opaCalls.at(-1)!, /parcel_number='632042200'/)
+    assert.deepEqual((await db.prepare('PRAGMA foreign_key_check').all()).results, [])
+    const corrected = await api<Property>(`properties/${property.id}`, 'PATCH', { version: property.version, enteredAddress: 'Philadelphia corrected' })
+    assert.equal(corrected.status, 200)
+    assert.equal(corrected.data.normalizedAddress, '810 SUSQUEHANNA RD, PHILADELPHIA, PA, 19111-9999')
+    opaMode = 'exact'
+    await processEnrichmentJobs({ ...env, PHILADELPHIA_OPA_ENABLED: 'true' })
+    const rematched = (await api<Detail>(`properties/${property.id}`)).data
+    assert.equal(rematched.enrichment[0].status, 'complete')
+    assert.equal(rematched.sourceRecords.length, 1)
+    assert.equal(rematched.sourceRecords[0].data.market_value, 236240)
+    assert.equal(rematched.sourceAttributes.find(attr => attr.key === 'assessedValue')?.value, 236240)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_source_records WHERE property_id=?').bind(property.id).first('total'), 3)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_identity WHERE property_id=?').bind(property.id).first('total'), 2)
+    assert.deepEqual((await db.prepare('PRAGMA foreign_key_check').all()).results, [])
+    await db.prepare('UPDATE property_enrichment_jobs SET created_at=? WHERE property_id=?').bind(old, property.id).run()
+    assert.equal((await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'opa-corrected' })).status, 202)
+    await processEnrichmentJobs({ ...env, PHILADELPHIA_OPA_ENABLED: 'true' })
+    assert.match(opaCalls.at(-1)!, /parcel_number='632042200'/)
+    assert.equal((await api<Detail>(`properties/${property.id}`)).data.enrichment[0].status, 'complete')
+    assert.deepEqual((await db.prepare('PRAGMA foreign_key_check').all()).results, [])
+    const bob = (await api<User>('me', 'GET', undefined, 'bob')).data
+    await api(`properties/${property.id}/members`, 'POST', { userId: bob.id, role: 'viewer' })
+    assert.equal((await api(`properties/${property.id}/enrichment`, 'POST', { idempotencyKey: 'viewer' }, 'bob')).status, 403)
+    assert.equal((await api<Detail>(`properties/${property.id}`, 'GET', undefined, 'bob')).data.sourceAttributes.length > 0, true)
+    await api(`properties/${property.id}/members/${encodeURIComponent(bob.id)}`, 'DELETE')
+    assert.equal((await api(`properties/${property.id}`, 'GET', undefined, 'bob')).status, 404)
+    const edited = await api<Property>(`properties/${property.id}`, 'PATCH', { version: corrected.data.version, enteredAddress: 'Single match' })
+    assert.equal(edited.status, 200)
+    assert.equal(edited.data.latitude, 41.2)
+    const changedAddress = (await api<Detail>(`properties/${property.id}`)).data
+    assert.equal(changedAddress.sourceRecords.length, 0)
+    assert.equal(changedAddress.sourceAttributes.length, 0)
+    assert.equal(changedAddress.property.attributes.assessedValue, 1)
+  } finally { opaMode = 'exact'; globalThis.fetch = originalFetch }
+})
+
+test('ambiguous and malformed OPA results never become matched property facts', async () => {
+  const first = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'philly-ambiguous',
+  })
+  assert.equal(first.status, 201)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    const enabled = { ...env, PHILADELPHIA_OPA_ENABLED: 'true' }
+    opaMode = 'ambiguous'
+    await processEnrichmentJobs(enabled)
+    const review = (await api<Detail>(`properties/${first.data.id}`)).data
+    assert.equal(review.enrichment[0].status, 'manual_review')
+    assert.match(review.enrichment[0].lastError!, /Ambiguous/)
+    assert.equal(review.sourceRecords.length, 0)
+    opaMode = 'unit'
+    const unit = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'philly-unit',
+    })
+    assert.equal(unit.status, 201)
+    await processEnrichmentJobs(enabled)
+    assert.equal((await api<Detail>(`properties/${unit.data.id}`)).data.enrichment[0].status, 'manual_review')
+    const second = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'philly-invalid',
+    })
+    assert.equal(second.status, 201)
+    opaMode = 'invalid'
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await processEnrichmentJobs(enabled)
+      const job = (await api<Detail>(`properties/${second.data.id}`)).data.enrichment[0]
+      assert.equal(job.attempts, attempt)
+      assert.equal(job.status, attempt === 3 ? 'failed' : 'pending')
+      if (attempt < 3) await db.prepare("UPDATE property_enrichment_jobs SET next_attempt_at='2020-01-01T00:00:00Z' WHERE id=?")
+        .bind(job.id).run()
+    }
+    const invalid = (await api<Detail>(`properties/${second.data.id}`)).data
+    assert.equal(invalid.sourceRecords.length, 0)
+    assert.equal(invalid.sourceAttributes.length, 0)
+    assert.match(invalid.enrichment[0].lastError!, /unsupported schema/)
+  } finally { opaMode = 'exact'; globalThis.fetch = originalFetch }
+})
+
+test('enrichment duplicate checks ignore historical addresses and use the scheduled property owner', async () => {
+  const enabled = { ...env, PHILADELPHIA_OPA_ENABLED: 'true' }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    const former = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'historical-parcel',
+    })
+    assert.equal(former.status, 201)
+    await processEnrichmentJobs(enabled)
+    assert.equal((await api<Detail>(`properties/${former.data.id}`)).data.enrichment[0].status, 'complete')
+    const moved = await api<Property>(`properties/${former.data.id}`, 'PATCH', {
+      version: former.data.version, enteredAddress: 'Single match',
+    })
+    assert.equal(moved.status, 200)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_identity WHERE property_id=?')
+      .bind(former.data.id).first('total'), 1)
+
+    const current = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'current-parcel',
+    })
+    assert.equal(current.status, 201)
+    await processEnrichmentJobs(enabled)
+    assert.equal((await api<Detail>(`properties/${current.data.id}`)).data.enrichment[0].status, 'complete')
+
+    const scheduled = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'scheduled-duplicate',
+    })
+    assert.equal(scheduled.status, 201)
+    await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable' WHERE property_id=?")
+      .bind(scheduled.data.id).run()
+    await jobInsert(env, scheduled.data, 'system:enricher', `scheduled:test:${scheduled.data.id}`)!.run()
+    await processEnrichmentJobs(enabled)
+    const review = (await api<Detail>(`properties/${scheduled.data.id}`)).data
+    assert.equal(review.enrichment[0].status, 'manual_review')
+    assert.match(review.enrichment[0].lastError!, /already linked to another accessible property/)
+    assert.equal(review.sourceRecords.length, 0)
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('manual refresh guards active jobs and cooldown within the insert', async () => {
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'guarded-refresh',
+  })
+  assert.equal(property.status, 201)
+  const old = new Date(Date.now() - 11 * 60000).toISOString()
+  await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable',created_at=? WHERE property_id=?")
+    .bind(old, property.data.id).run()
+  const refreshAfter = new Date(Date.now() - 10 * 60000).toISOString()
+  const firstKey = `manual:${user.id}:${property.data.id}:racing-1`
+  const secondKey = `manual:${user.id}:${property.data.id}:racing-2`
+  await db.batch([
+    jobInsert(env, property.data, user.id, firstKey, { refreshAfter })!,
+    jobInsert(env, property.data, user.id, secondKey, { refreshAfter })!,
+  ])
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key IN (?,?)')
+    .bind(firstKey, secondKey).first('total'), 1)
+  assert.equal((await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'active-race' })).status, 409)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='complete' WHERE event_key=?").bind(firstKey).run()
+  await jobInsert(env, property.data, user.id, `manual:${user.id}:${property.data.id}:cooldown-race`, { refreshAfter })!.run()
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=?')
+    .bind(property.data.id).first('total'), 2)
+  assert.equal((await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'recent-race' })).status, 429)
+})
+
+test('address-edit enrichment job requires its guarded update to succeed', async () => {
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'guarded-edit',
+  })
+  assert.equal(property.status, 201)
+  const winner = await api<Property>(`properties/${property.data.id}`, 'PATCH', {
+    version: property.data.version, enteredAddress: 'Philadelphia scheduler fixture',
+  })
+  assert.equal(winner.status, 200)
+  const winnerKey = `address:${property.data.id}:${winner.data.version}`
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key=?')
+    .bind(winnerKey).first('total'), 1)
+
+  const loserKey = `${winnerKey}:loser`
+  const historyBefore = await db.prepare('SELECT count(*) AS total FROM property_history WHERE property_id=?')
+    .bind(property.data.id).first('total')
+  const losing = { ...property.data, version: winner.data.version }
+  const [update] = await db.batch([
+    db.prepare('UPDATE properties SET version=?,data=? WHERE id=? AND version=? RETURNING id')
+      .bind(losing.version, JSON.stringify(losing), losing.id, property.data.version),
+    jobInsert(env, losing, user.id, loserKey, { afterUpdate: true })!,
+  ])
+  assert.deepEqual(update.results, [])
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key=?')
+    .bind(loserKey).first('total'), 0)
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_history WHERE property_id=?')
+    .bind(property.data.id).first('total'), historyBefore)
+  assert.equal((await api<Detail>(`properties/${property.data.id}`)).data.property.normalizedAddress,
+    winner.data.normalizedAddress)
+})
+
+test('scheduler ignores old manual reviews after a successful refresh or address change', async () => {
+  const enabled = { ...env, PHILADELPHIA_OPA_ENABLED: 'true' }
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'review-scheduler',
+  })
+  assert.equal(property.status, 201)
+  const old = new Date(Date.now() - 31 * 86400000).toISOString()
+  await db.prepare("UPDATE property_enrichment_jobs SET status='manual_review',created_at=? WHERE property_id=?")
+    .bind(old, property.data.id).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 0)
+
+  const refresh = await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'resolved-review' })
+  assert.equal(refresh.status, 202)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='complete',created_at=? WHERE event_key=?")
+    .bind(old, `manual:${user.id}:${property.data.id}:resolved-review`).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 1)
+
+  const corrected = await api<Property>(`properties/${property.data.id}`, 'PATCH', {
+    version: property.data.version, enteredAddress: 'Philadelphia scheduler fixture',
+  })
+  assert.equal(corrected.status, 200)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable',created_at=? WHERE property_id=? AND matched_address=?")
+    .bind(old, property.data.id, corrected.data.normalizedAddress).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 2)
 })

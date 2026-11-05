@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Layer, LayerFeature, Property, SavedView } from '../shared/types'
-import { attributeNamePattern, compareValues, defaultView, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, matchesAttribute, moveProperty, newPropertyAIRule, parseAttributes, propertyBinChoices, propertyLayerVisible, validateReminderInstant, verificationStatusLabel } from '../src/utils'
+import { attributeNamePattern, compareValues, defaultView, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, matchesAttribute, moveProperty, newPropertyAIRule, parseAttributes, propertyBinChoices, propertyLayerVisible, restoreSavedView, validateReminderInstant, verificationStatusLabel } from '../src/utils'
+import { propertyLabel } from '../shared/property'
 
 const property = (overrides: Partial<Property> = {}): Property => ({
   id: 'p1', name: 'Alpha', enteredAddress: '123 Main Street', normalizedAddress: null,
@@ -15,8 +16,8 @@ const withFilters = (filters: Partial<SavedView['filters']>): SavedView => ({
 })
 
 test('fallback view matches canonical server defaults and property map toggle is respected', () => {
-  assert.deepEqual(defaultView.columns, ['name', 'enteredAddress', 'binId', 'tags', 'verificationStatus'])
-  assert.deepEqual(defaultView.sorts, [{ field: 'name', direction: 'asc' }])
+  assert.deepEqual(defaultView.columns, ['displayAddress', 'binId', 'tags', 'verificationStatus', 'updatedAt'])
+  assert.deepEqual(defaultView.sorts, [{ field: 'displayAddress', direction: 'asc' }])
   assert.deepEqual(defaultView.layers, ['properties'])
   assert.equal(fieldValue(property(), 'attributes.area'), 900)
   assert.equal(propertyLayerVisible(defaultView), true)
@@ -24,6 +25,19 @@ test('fallback view matches canonical server defaults and property map toggle is
   assert.equal(propertyLayerVisible({ layers: ['context'] }), false)
 })
 
+test('addresses label legacy and new properties; invalid views recover without overriding an intentional hidden layer', () => {
+  const legacy = property({ name: 'Old alias', enteredAddress: '123 Main St', normalizedAddress: '123 MAIN ST, PHILADELPHIA, PA, 19111' })
+  assert.equal(propertyLabel(legacy), '123 MAIN ST, PHILADELPHIA, PA, 19111')
+  assert.equal(fieldValue(legacy, 'name'), propertyLabel(legacy))
+  assert.equal(propertyLabel(property({ name: undefined, enteredAddress: ' 456 Oak St ' })), '456 Oak St')
+  assert.equal(propertyLabel(property({ id: 'ad8c4efa-1234', name: undefined, enteredAddress: '' })), 'Property ad8c4efa')
+  assert.equal(filterProperties([legacy], withFilters({ search: 'PHILADELPHIA' })).length, 1)
+  const hidden = { ...structuredClone(defaultView), layers: [] }
+  assert.deepEqual(restoreSavedView(hidden), hidden)
+  assert.equal(propertyLayerVisible(restoreSavedView(hidden)), false)
+  assert.throws(() => restoreSavedView({ ...hidden, layers: 'invalid' }), /Saved view is invalid/)
+  assert.throws(() => restoreSavedView({ columns: ['name'] }), /Saved view is invalid/)
+})
 test('verified address status is presented as geocoded without changing other statuses', () => {
   assert.equal(verificationStatusLabel('verified'), 'Geocoded')
   assert.equal(verificationStatusLabel('unverified'), 'unverified')
@@ -35,12 +49,12 @@ test('nullable new-property AI defaults remain disabled until explicit precreati
   const fallback = newPropertyAIRule(null)
   assert.equal(fallback.enabled, false)
   assert.deepEqual(fallback.triggers, ['creation'])
-  assert.deepEqual(fallback.fields, ['name', 'enteredAddress'])
+  assert.deepEqual(fallback.fields, ['enteredAddress'])
   const configured = { ...fallback, enabled: true }
   const copied = newPropertyAIRule(configured)
   assert.deepEqual(copied, configured)
   copied.fields.push('tags')
-  assert.deepEqual(configured.fields, ['name', 'enteredAddress'])
+  assert.deepEqual(configured.fields, ['enteredAddress'])
 })
 
 test('all views share search, bin, tag, and attribute filters without mutating records', () => {
@@ -89,9 +103,9 @@ test('supported reference attributes share search and filter semantics with prop
 
 test('multi-sort honors numeric attributes, date order and stable ID tie-breaks', () => {
   const records = [
-    property({ id: 'c', name: 'Gamma', attributes: { area: 100 }, updatedAt: '2026-10-01T10:00:00+02:00' }),
-    property({ id: 'b', name: 'Beta', attributes: { area: 10 }, updatedAt: '2026-10-01T09:00:00Z' }),
-    property({ id: 'a', name: 'Alpha', attributes: { area: 10 }, updatedAt: '2026-10-01T09:00:00Z' }),
+    property({ id: 'c', name: 'Gamma', enteredAddress: 'Gamma Street', attributes: { area: 100 }, updatedAt: '2026-10-01T10:00:00+02:00' }),
+    property({ id: 'b', name: 'Beta', enteredAddress: 'Beta Street', attributes: { area: 10 }, updatedAt: '2026-10-01T09:00:00Z' }),
+    property({ id: 'a', name: 'Alpha', enteredAddress: 'Alpha Street', attributes: { area: 10 }, updatedAt: '2026-10-01T09:00:00Z' }),
   ]
   const view = structuredClone(defaultView)
   view.sorts = [{ field: 'attributes.area', direction: 'asc' }, { field: 'name', direction: 'desc' }]

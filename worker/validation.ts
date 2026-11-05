@@ -74,14 +74,14 @@ export function timeZone(value: unknown): string {
   return zone
 }
 export const DEFAULT_VIEW: SavedView = {
-  columns: ['name', 'enteredAddress', 'binId', 'tags', 'verificationStatus'],
-  sorts: [{ field: 'name', direction: 'asc' }],
+  columns: ['displayAddress', 'binId', 'tags', 'verificationStatus', 'updatedAt'],
+  sorts: [{ field: 'displayAddress', direction: 'asc' }],
   filters: { search: '', binId: '', tag: '', attribute: '', value: '' }, layers: ['properties'],
 }
 export function savedView(value: unknown): SavedView {
   const v = object(value)
   keys(v, ['columns', 'sorts', 'filters', 'layers'])
-  const validField = (f: string) => [...PROPERTY_FIELDS, 'createdAt', 'updatedAt', 'creatorStamp', 'creatorName', 'version'].includes(f as never) || /^attributes\.[a-zA-Z][\w -]{0,63}$/.test(f)
+  const validField = (f: string) => [...PROPERTY_FIELDS, 'displayAddress', 'createdAt', 'updatedAt', 'creatorStamp', 'creatorName', 'version'].includes(f as never) || /^attributes\.[a-zA-Z][\w -]{0,63}$/.test(f)
   const columns = strings(v.columns, 'columns', 30)
   assert(columns.every(validField), 'Invalid column')
   assert(Array.isArray(v.sorts) && v.sorts.length <= 5, 'Invalid sorts')
