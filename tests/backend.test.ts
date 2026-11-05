@@ -7,6 +7,7 @@ import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
+import { protectOrigin } from '../worker/auth'
 import worker from '../worker/index'
 import type { Env } from '../worker/index'
 import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, PropertyArea, Reminder, SavedView, User } from '../shared/types'
@@ -172,6 +173,29 @@ test('Access verifies JWTs and isolates owners; cross-origin and forged headers 
   assert.deepEqual((await api<Property[]>('properties', 'GET', undefined, 'bob')).data, [])
   const bobBin = (await api<Bin[]>('bins', 'GET', undefined, 'bob')).data[0]
   assert.equal((await api('properties', 'POST', { name: 'No', enteredAddress: '', binId: bobBin.id })).status, 404)
+})
+
+test('Preview mutations allow only same-origin requests on provisioned Preview hostnames', () => {
+  const previewEnv = { ...env, PREVIEW_WORKER_HOSTNAME: 'reops-ui.anthonyrvillar.workers.dev' }
+  const previewOrigin = 'https://feature-7-reops-ui.anthonyrvillar.workers.dev'
+  const mutation = (url: string, requestOrigin: string, method = 'POST', headers: Record<string, string> = {}) =>
+    new Request(`${url}/api/bins`, { method, headers: { Origin: requestOrigin, 'Content-Type': 'application/json', ...headers } })
+
+  for (const method of ['POST', 'PATCH']) {
+    assert.doesNotThrow(() => protectOrigin(mutation(previewOrigin, previewOrigin, method), previewEnv))
+    assert.throws(() => protectOrigin(mutation(previewOrigin, origin, method), previewEnv), { status: 403 })
+    assert.throws(() => protectOrigin(mutation(previewOrigin, previewOrigin, method, { 'Sec-Fetch-Site': 'cross-site' }), previewEnv), { status: 403 })
+  }
+  for (const untrusted of [
+    origin,
+    'https://feature-7-reops-ui.anthonyrvillar.workers.dev.evil.example',
+    'https://feature-7-reops-ui.evil.example',
+    'http://feature-7-reops-ui.anthonyrvillar.workers.dev',
+    'https://feature-7-reops-ui.anthonyrvillar.workers.dev:8443',
+  ]) {
+    assert.throws(() => protectOrigin(mutation(untrusted, untrusted), previewEnv), { status: 403 })
+  }
+  assert.throws(() => protectOrigin(mutation(previewOrigin, previewOrigin), { ...env, APP_ORIGIN: origin }), { status: 403 })
 })
 
 test('production-mode Access authenticates real Worker assets and D1 API without development auth', async () => {

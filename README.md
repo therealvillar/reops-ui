@@ -45,6 +45,7 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 1. Authenticate Wrangler: `npx wrangler login`.
 2. Use the existing release D1 database configured in `wrangler.jsonc`. For a separate account, create a new database with `npx wrangler d1 create reops` and replace `database_id` with its returned ID; do not apply migrations to an unrelated database.
 3. Set `APP_ORIGIN` to the exact HTTPS origin where this app will be served.
+   Branch Previews use `PREVIEW_WORKER_HOSTNAME` instead: set it to the exact production Worker hostname (without a scheme) so only same-origin requests on `<preview-name>-<worker-hostname>` are accepted. Protect Preview hostnames with Cloudflare Access before serving private records.
 4. Create a Cloudflare Zero Trust **Access self-hosted application** covering the entire application hostname, with an explicit allow policy. Set `ACCESS_TEAM_DOMAIN` (hostname only, e.g. `team.cloudflareaccess.com`) and `ACCESS_AUD` to that application's audience.
 5. Do **not** set `DEV_AUTH` on the deployed Worker. The API must fail closed when production identity configuration is missing.
 6. Apply migrations: `npm run db:remote`.

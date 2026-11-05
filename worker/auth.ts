@@ -46,6 +46,13 @@ export function protectOrigin(request: Request, env: Env) {
           !configured.username && !configured.password && configured.pathname === '/' && !configured.search && !configured.hash) allowedOrigins.add(configured.origin)
       } catch { /* An invalid development origin must not broaden the allowlist. */ }
     }
+  } else if (env.PREVIEW_WORKER_HOSTNAME) {
+    const suffix = `-${env.PREVIEW_WORKER_HOSTNAME}`
+    const previewName = requestUrl.hostname.endsWith(suffix) ? requestUrl.hostname.slice(0, -suffix.length) : ''
+    if (requestUrl.protocol !== 'https:' || requestUrl.port || !/^[a-z0-9-]+$/.test(previewName)) {
+      throw new HttpError(403, 'Cross-origin mutations are forbidden')
+    }
+    allowedOrigins.add(requestUrl.origin)
   } else {
     if (!env.APP_ORIGIN) throw new HttpError(503, 'Application origin is not configured')
     allowedOrigins.add(env.APP_ORIGIN)
