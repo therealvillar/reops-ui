@@ -153,6 +153,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       if (!b.allowDuplicate && enteredAddress.trim()) {
         const duplicate = await env.DB.prepare("SELECT p.id FROM properties p WHERE (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?)) AND (UPPER(TRIM(json_extract(p.data,'$.enteredAddress')))=UPPER(TRIM(?)) OR (? IS NOT NULL AND UPPER(TRIM(json_extract(p.data,'$.normalizedAddress')))=UPPER(TRIM(?)))) LIMIT 1")
           .bind(user.id, user.id, enteredAddress, selected.normalizedAddress, selected.normalizedAddress).first<{ id: string }>()
+        if (duplicate && key) {
+          const previous = await creationByKey(env, user, key, hash!)
+          if (previous) return response(previous)
+        }
         assert(!duplicate, `A property at this address is already in your accessible portfolio (${duplicate?.id}). Check it before creating another, or explicitly allow a separate record.`, 409)
       }
       const now = new Date().toISOString()
@@ -224,7 +228,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         next.version++; next.updatedBy = user.id; next.updatedAt = new Date().toISOString()
         const statement = env.DB.prepare("UPDATE properties SET bin_id=?,updated_by=?,updated_at=?,version=?,data=? WHERE id=? AND owner_id=? AND version=? AND (owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=properties.id AND m.user_id=? AND m.role='editor')) RETURNING id,owner_id,version,data")
           .bind(next.binId, user.id, next.updatedAt, next.version, JSON.stringify(next), id, p.creatorId, b.version, user.id, user.id)
-        const job = next.normalizedAddress !== p.normalizedAddress ? jobInsert(env, next, user.id, `address:${id}:${next.version}`) : null
+        const job = next.normalizedAddress !== p.normalizedAddress ? jobInsert(env, next, user.id, `address:${id}:${next.version}`, { afterUpdate: true }) : null
         const updated = job
           ? (await env.DB.batch([statement, job]))[0].results[0] as PropertyRow | undefined
           : await statement.first<PropertyRow>()

@@ -7,7 +7,7 @@ import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
-import { processEnrichmentJobs, scheduleEnrichment } from '../worker/enrichment'
+import { jobInsert, processEnrichmentJobs, scheduleEnrichment } from '../worker/enrichment'
 import { protectOrigin } from '../worker/auth'
 import worker from '../worker/index'
 import type { Env } from '../worker/index'
@@ -1148,8 +1148,59 @@ test('standard creation needs a geocode, explicit drafts remain possible, and cr
   assert.equal(repeat.data.id, draft.data.id)
   assert.equal((await api('properties', 'POST', { ...input, unlocatedDraft: true, tags: ['changed'] })).status, 409)
   assert.equal((await api('properties', 'POST', { enteredAddress: 'Strict draft unique', binId: bin.id, unlocatedDraft: true })).status, 409)
+  assert.equal((await api('properties', 'POST', { ...input, unlocatedDraft: true, idempotencyKey: 'strict-creation-2' })).status, 409)
   assert.equal((await api('properties', 'POST', { enteredAddress: '', binId: bin.id })).status, 422)
   assert.equal((await api('properties', 'POST', { enteredAddress: '', binId: bin.id, unlocatedDraft: true })).status, 201)
+})
+
+test('creation retries recover by key when the first request commits during geocoding', async () => {
+  const input = { enteredAddress: 'Concurrent creation draft', binId: bin.id, unlocatedDraft: true, idempotencyKey: 'concurrent-creation-1' }
+  let signalGeocoding!: () => void
+  let releaseGeocoding!: () => void
+  const geocoding = new Promise<void>(resolve => { signalGeocoding = resolve })
+  const firstCreated = new Promise<void>(resolve => { releaseGeocoding = resolve })
+  const controlledDB = new Proxy(db, {
+    get(target, property) {
+      if (property !== 'prepare') return Reflect.get(target, property, target)
+      return (query: string) => {
+        const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+          get(targetStatement, member) {
+            if (member === 'bind') return (...values: Parameters<D1PreparedStatement['bind']>) => wrap(targetStatement.bind(...values))
+            if (query.startsWith('SELECT matched_address,latitude,longitude,components FROM property_gps') && member === 'all')
+              return async (...args: never[]) => {
+                signalGeocoding()
+                await firstCreated
+                return targetStatement.all(...args)
+              }
+            const result = Reflect.get(targetStatement, member, targetStatement)
+            return typeof result === 'function' ? result.bind(targetStatement) : result
+          },
+        })
+        return wrap(target.prepare(query))
+      }
+    },
+  }) as D1Database
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((request: RequestInfo | URL, options?: RequestInit) => upstream(new Request(request, options))) as typeof fetch
+  try {
+    const retry = worker.fetch(new Request(`${origin}/api/properties`, {
+      method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': tokens.alice, 'Content-Type': 'application/json', Origin: origin },
+      body: JSON.stringify(input),
+    }), { ...env, DB: controlledDB, ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin },
+    {} as ExecutionContext)
+    await geocoding
+    const created = await api<Property>('properties', 'POST', input)
+    assert.equal(created.status, 201)
+    releaseGeocoding()
+    const replay = await retry
+    assert.equal(replay.status, 200)
+    assert.equal((await replay.json() as Property).id, created.data.id)
+    assert.equal(await db.prepare('SELECT COUNT(*) AS total FROM properties WHERE owner_id=? AND create_key=?')
+      .bind(user.id, input.idempotencyKey).first('total'), 1)
+  } finally {
+    releaseGeocoding()
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('enrichment is durable, source-gated, exact-matched, provenance-preserving and does not change CRM data', async () => {
@@ -1287,4 +1338,132 @@ test('ambiguous and malformed OPA results never become matched property facts', 
     assert.equal(invalid.sourceAttributes.length, 0)
     assert.match(invalid.enrichment[0].lastError!, /unsupported schema/)
   } finally { opaMode = 'exact'; globalThis.fetch = originalFetch }
+})
+
+test('enrichment duplicate checks ignore historical addresses and use the scheduled property owner', async () => {
+  const enabled = { ...env, PHILADELPHIA_OPA_ENABLED: 'true' }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    const former = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'historical-parcel',
+    })
+    assert.equal(former.status, 201)
+    await processEnrichmentJobs(enabled)
+    assert.equal((await api<Detail>(`properties/${former.data.id}`)).data.enrichment[0].status, 'complete')
+    const moved = await api<Property>(`properties/${former.data.id}`, 'PATCH', {
+      version: former.data.version, enteredAddress: 'Single match',
+    })
+    assert.equal(moved.status, 200)
+    assert.equal(await db.prepare('SELECT count(*) AS total FROM property_identity WHERE property_id=?')
+      .bind(former.data.id).first('total'), 1)
+
+    const current = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'current-parcel',
+    })
+    assert.equal(current.status, 201)
+    await processEnrichmentJobs(enabled)
+    assert.equal((await api<Detail>(`properties/${current.data.id}`)).data.enrichment[0].status, 'complete')
+
+    const scheduled = await api<Property>('properties', 'POST', {
+      enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'scheduled-duplicate',
+    })
+    assert.equal(scheduled.status, 201)
+    await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable' WHERE property_id=?")
+      .bind(scheduled.data.id).run()
+    await jobInsert(env, scheduled.data, 'system:enricher', `scheduled:test:${scheduled.data.id}`)!.run()
+    await processEnrichmentJobs(enabled)
+    const review = (await api<Detail>(`properties/${scheduled.data.id}`)).data
+    assert.equal(review.enrichment[0].status, 'manual_review')
+    assert.match(review.enrichment[0].lastError!, /already linked to another accessible property/)
+    assert.equal(review.sourceRecords.length, 0)
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('manual refresh guards active jobs and cooldown within the insert', async () => {
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'guarded-refresh',
+  })
+  assert.equal(property.status, 201)
+  const old = new Date(Date.now() - 11 * 60000).toISOString()
+  await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable',created_at=? WHERE property_id=?")
+    .bind(old, property.data.id).run()
+  const refreshAfter = new Date(Date.now() - 10 * 60000).toISOString()
+  const firstKey = `manual:${user.id}:${property.data.id}:racing-1`
+  const secondKey = `manual:${user.id}:${property.data.id}:racing-2`
+  await db.batch([
+    jobInsert(env, property.data, user.id, firstKey, { refreshAfter })!,
+    jobInsert(env, property.data, user.id, secondKey, { refreshAfter })!,
+  ])
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key IN (?,?)')
+    .bind(firstKey, secondKey).first('total'), 1)
+  assert.equal((await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'active-race' })).status, 409)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='complete' WHERE event_key=?").bind(firstKey).run()
+  await jobInsert(env, property.data, user.id, `manual:${user.id}:${property.data.id}:cooldown-race`, { refreshAfter })!.run()
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=?')
+    .bind(property.data.id).first('total'), 2)
+  assert.equal((await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'recent-race' })).status, 429)
+})
+
+test('address-edit enrichment job requires its guarded update to succeed', async () => {
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'guarded-edit',
+  })
+  assert.equal(property.status, 201)
+  const winner = await api<Property>(`properties/${property.data.id}`, 'PATCH', {
+    version: property.data.version, enteredAddress: 'Philadelphia scheduler fixture',
+  })
+  assert.equal(winner.status, 200)
+  const winnerKey = `address:${property.data.id}:${winner.data.version}`
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key=?')
+    .bind(winnerKey).first('total'), 1)
+
+  const loserKey = `${winnerKey}:loser`
+  const historyBefore = await db.prepare('SELECT count(*) AS total FROM property_history WHERE property_id=?')
+    .bind(property.data.id).first('total')
+  const losing = { ...property.data, version: winner.data.version }
+  const [update] = await db.batch([
+    db.prepare('UPDATE properties SET version=?,data=? WHERE id=? AND version=? RETURNING id')
+      .bind(losing.version, JSON.stringify(losing), losing.id, property.data.version),
+    jobInsert(env, losing, user.id, loserKey, { afterUpdate: true })!,
+  ])
+  assert.deepEqual(update.results, [])
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_enrichment_jobs WHERE event_key=?')
+    .bind(loserKey).first('total'), 0)
+  assert.equal(await db.prepare('SELECT count(*) AS total FROM property_history WHERE property_id=?')
+    .bind(property.data.id).first('total'), historyBefore)
+  assert.equal((await api<Detail>(`properties/${property.data.id}`)).data.property.normalizedAddress,
+    winner.data.normalizedAddress)
+})
+
+test('scheduler ignores old manual reviews after a successful refresh or address change', async () => {
+  const enabled = { ...env, PHILADELPHIA_OPA_ENABLED: 'true' }
+  const property = await api<Property>('properties', 'POST', {
+    enteredAddress: 'Philadelphia exact', binId: bin.id, allowDuplicate: true, idempotencyKey: 'review-scheduler',
+  })
+  assert.equal(property.status, 201)
+  const old = new Date(Date.now() - 31 * 86400000).toISOString()
+  await db.prepare("UPDATE property_enrichment_jobs SET status='manual_review',created_at=? WHERE property_id=?")
+    .bind(old, property.data.id).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 0)
+
+  const refresh = await api(`properties/${property.data.id}/enrichment`, 'POST', { idempotencyKey: 'resolved-review' })
+  assert.equal(refresh.status, 202)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='complete',created_at=? WHERE event_key=?")
+    .bind(old, `manual:${user.id}:${property.data.id}:resolved-review`).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 1)
+
+  const corrected = await api<Property>(`properties/${property.data.id}`, 'PATCH', {
+    version: property.data.version, enteredAddress: 'Philadelphia scheduler fixture',
+  })
+  assert.equal(corrected.status, 200)
+  await db.prepare("UPDATE property_enrichment_jobs SET status='unavailable',created_at=? WHERE property_id=? AND matched_address=?")
+    .bind(old, property.data.id, corrected.data.normalizedAddress).run()
+  await scheduleEnrichment(enabled)
+  assert.equal(await db.prepare("SELECT count(*) AS total FROM property_enrichment_jobs WHERE property_id=? AND event_key LIKE 'scheduled:%'")
+    .bind(property.data.id).first('total'), 2)
 })

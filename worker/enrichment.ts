@@ -72,10 +72,19 @@ function subject(property: Property): { street: string; zip: string } | null {
   return { street: match[1].trim().toUpperCase().replace(/\s+/g, ' '), zip: match[2] }
 }
 
-export function jobInsert(env: Env, property: Property, requestedBy: string, eventKey: string): D1PreparedStatement | null {
+export function jobInsert(
+  env: Env, property: Property, requestedBy: string, eventKey: string,
+  guards: { afterUpdate?: boolean; refreshAfter?: string } = {},
+): D1PreparedStatement | null {
   if (!subject(property)) return null
-  return env.DB.prepare("INSERT OR IGNORE INTO property_enrichment_jobs(id,property_id,owner_id,source_id,created_at,event_key,requested_by,matched_address) SELECT ?,p.id,p.owner_id,?,?,?,?,? FROM properties p WHERE p.id=? AND p.version=?")
-    .bind(crypto.randomUUID(), sourceId, new Date().toISOString(), eventKey, requestedBy, property.normalizedAddress, property.id, property.version)
+  // In the address-edit batch, changes() is the preceding guarded property UPDATE's row count.
+  const updated = guards.afterUpdate ? ' AND changes()=1' : ''
+  const refresh = guards.refreshAfter === undefined ? '' :
+    " AND NOT EXISTS(SELECT 1 FROM property_enrichment_jobs j WHERE j.property_id=p.id AND j.source_id=? AND j.status IN ('pending','running'))" +
+    ' AND NOT EXISTS(SELECT 1 FROM property_enrichment_jobs j WHERE j.property_id=p.id AND j.source_id=? AND j.created_at>?)'
+  return env.DB.prepare(`INSERT OR IGNORE INTO property_enrichment_jobs(id,property_id,owner_id,source_id,created_at,event_key,requested_by,matched_address) SELECT ?,p.id,p.owner_id,?,?,?,?,? FROM properties p WHERE p.id=? AND p.version=?${updated}${refresh}`)
+    .bind(crypto.randomUUID(), sourceId, new Date().toISOString(), eventKey, requestedBy, property.normalizedAddress,
+      property.id, property.version, ...(guards.refreshAfter === undefined ? [] : [sourceId, sourceId, guards.refreshAfter]))
 }
 
 export function jobModel(row: JobRow): EnrichmentJob {
@@ -86,6 +95,7 @@ export function jobModel(row: JobRow): EnrichmentJob {
 export async function enqueueRefresh(env: Env, property: Property, requestedBy: string, key: string): Promise<EnrichmentJob> {
   assert(subject(property), 'An exact Philadelphia address with a geocoded location and ZIP is required for OPA enrichment', 422)
   const eventKey = `manual:${requestedBy}:${property.id}:${key}`
+  const refreshAfter = new Date(Date.now() - 10 * 60000).toISOString()
   const previous = await env.DB.prepare('SELECT * FROM property_enrichment_jobs WHERE event_key=?').bind(eventKey).first<JobRow>()
   if (previous) {
     assert(previous.matched_address === property.normalizedAddress, 'Idempotency key was already used for a different address', 409)
@@ -95,9 +105,9 @@ export async function enqueueRefresh(env: Env, property: Property, requestedBy: 
     .bind(property.id, sourceId).first()
   assert(!active, 'Enrichment is already queued or running', 409)
   const recent = await env.DB.prepare("SELECT id FROM property_enrichment_jobs WHERE property_id=? AND source_id=? AND created_at>? ORDER BY created_at DESC LIMIT 1")
-    .bind(property.id, sourceId, new Date(Date.now() - 10 * 60000).toISOString()).first()
+    .bind(property.id, sourceId, refreshAfter).first()
   assert(!recent, 'Wait ten minutes before requesting another enrichment refresh', 429)
-  await jobInsert(env, property, requestedBy, eventKey)!.run()
+  await jobInsert(env, property, requestedBy, eventKey, { refreshAfter })!.run()
   const row = await env.DB.prepare('SELECT * FROM property_enrichment_jobs WHERE event_key=? AND property_id=?')
     .bind(eventKey, property.id).first<JobRow>()
   assert(row, 'Property changed. Reload before refreshing enrichment.', 409)
@@ -264,8 +274,9 @@ async function processJob(env: Env, job: JobRow): Promise<void> {
       const matches = candidates.filter(candidate => matchRow(property, candidate, identity?.identifier_value ?? null))
       if (matches.length === 1 && /^[A-Za-z0-9-]{5,32}$/.test(matches[0].parcel_number?.toString() ?? '')) {
         const parcel = matches[0].parcel_number!.toString()
-        const duplicate = await env.DB.prepare("SELECT i.property_id FROM property_identity i JOIN properties p ON p.id=i.property_id WHERE i.jurisdiction='philadelphia' AND i.identifier_type='opa_parcel_number' AND i.identifier_value=? AND i.property_id!=? AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?)) LIMIT 1")
-          .bind(parcel, property.id, claimed.requested_by, claimed.requested_by).first<{ property_id: string }>()
+        const principal = claimed.requested_by === 'system:enricher' ? claimed.owner_id : claimed.requested_by
+        const duplicate = await env.DB.prepare("SELECT i.property_id FROM property_identity i JOIN properties p ON p.id=i.property_id WHERE i.jurisdiction='philadelphia' AND i.identifier_type='opa_parcel_number' AND i.identifier_value=? AND i.property_id!=? AND json_extract(p.data,'$.normalizedAddress')=i.matched_address AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=?)) LIMIT 1")
+          .bind(parcel, property.id, principal, principal).first<{ property_id: string }>()
         if (duplicate) message = `OPA parcel is already linked to another accessible property (${duplicate.property_id}); review duplicates before associating.`
         else {
           await saveMatch(env, property, matches[0], Boolean(identity))
@@ -302,11 +313,11 @@ export async function processEnrichmentJobs(env: Env): Promise<void> {
 
 export async function scheduleEnrichment(env: Env): Promise<void> {
   if (env.PHILADELPHIA_OPA_ENABLED !== 'true') return
-  const rows = await env.DB.prepare("SELECT p.data FROM properties p WHERE json_extract(p.data,'$.verificationStatus')='verified' AND upper(json_extract(p.data,'$.normalizedAddress')) LIKE '%, PHILADELPHIA, PA,%' AND NOT EXISTS(SELECT 1 FROM property_enrichment_jobs j WHERE j.property_id=p.id AND j.source_id=? AND (j.status IN ('pending','running','manual_review') OR (j.status!='unavailable' AND j.created_at>?))) ORDER BY p.created_at LIMIT 2")
+  const rows = await env.DB.prepare("SELECT p.data FROM properties p WHERE json_extract(p.data,'$.verificationStatus')='verified' AND upper(json_extract(p.data,'$.normalizedAddress')) LIKE '%, PHILADELPHIA, PA,%' AND NOT EXISTS(SELECT 1 FROM property_enrichment_jobs j WHERE j.property_id=p.id AND j.source_id=? AND j.matched_address=json_extract(p.data,'$.normalizedAddress') AND (j.status IN ('pending','running') OR (j.status='manual_review' AND j.id=(SELECT latest.id FROM property_enrichment_jobs latest WHERE latest.property_id=j.property_id AND latest.source_id=j.source_id AND latest.matched_address=j.matched_address ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)) OR (j.status!='unavailable' AND j.created_at>?))) ORDER BY p.created_at LIMIT 2")
     .bind(sourceId, new Date(Date.now() - 30 * 86400000).toISOString()).all<{ data: string }>()
   for (const row of rows.results) {
     const property = JSON.parse(row.data) as Property
-    const statement = jobInsert(env, property, 'system:enricher', `scheduled:${property.id}:${new Date().toISOString().slice(0, 10)}`)
+    const statement = jobInsert(env, property, 'system:enricher', `scheduled:${property.id}:${property.version}:${new Date().toISOString().slice(0, 10)}`)
     if (statement) await statement.run()
   }
 }
