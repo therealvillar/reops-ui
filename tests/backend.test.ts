@@ -547,6 +547,30 @@ test('cron reminder delivery has atomic persisted notifications, stable authors,
   await api(`properties/${p.id}/members/${encodeURIComponent(bob.id)}`, 'DELETE')
 })
 
+test('metadata-only reminder edits do not overwrite concurrent cancellation/completion state', async () => {
+  const p = await createProperty('Reminder race safety')
+  const created = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', { title: 'Race target', dueAt: '2030-01-01T00:00:00Z', timeZone: 'UTC' })
+  assert.equal(created.status, 201)
+  const rid = created.data.id
+
+  const cancelled = await api<Reminder>(`properties/${p.id}/reminders/${rid}`, 'PATCH', { state: 'cancelled' })
+  assert.equal(cancelled.status, 200)
+  assert.equal(cancelled.data.state, 'cancelled')
+  const titleEdited = await api<Reminder>(`properties/${p.id}/reminders/${rid}`, 'PATCH', { title: 'Title edit under race' })
+  assert.equal(titleEdited.status, 200)
+  assert.equal(titleEdited.data.state, 'cancelled')
+  const dueEdited = await api<Reminder>(`properties/${p.id}/reminders/${rid}`, 'PATCH', { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' })
+  assert.equal(dueEdited.status, 200)
+  assert.equal(dueEdited.data.state, 'cancelled')
+
+  const completed = await api<Reminder>(`properties/${p.id}/reminders/${rid}`, 'PATCH', { state: 'completed' })
+  assert.equal(completed.status, 200)
+  assert.equal(completed.data.state, 'completed')
+  const finalEdit = await api<Reminder>(`properties/${p.id}/reminders/${rid}`, 'PATCH', { title: 'Completed title edit' })
+  assert.equal(finalEdit.status, 200)
+  assert.equal(finalEdit.data.state, 'completed')
+})
+
 test('pending AI execution rechecks collaborator grants and current automatic rule consent before sending', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
