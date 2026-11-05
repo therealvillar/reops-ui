@@ -381,7 +381,7 @@ test('partial reminder edits cannot restore a concurrently cancelled or complete
     const updatedReminder = result.data.reminders.find(item => item.id === reminder.data.id)!
     assert.equal(updatedReminder.title, 'Updated title')
     assert.equal(updatedReminder.state, state)
-    assert.equal((await api<Notification[]>('notifications')).data.some(item => item.reminderId === reminder.data.id), false)
+    assert.equal(await db.prepare('SELECT id FROM notifications WHERE reminder_id=?').bind(reminder.data.id).first(), null)
   }
 })
 
