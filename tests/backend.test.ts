@@ -547,7 +547,7 @@ test('cron reminder delivery has atomic persisted notifications, stable authors,
   await api(`properties/${p.id}/members/${encodeURIComponent(bob.id)}`, 'DELETE')
 })
 
-test('metadata-only reminder edits do not overwrite concurrent cancellation/completion state', async () => {
+test('metadata-only reminder edits preserve concurrent reminder fields', async () => {
   const p = await createProperty('Reminder race safety')
   const created = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', { title: 'Race target', dueAt: '2030-01-01T00:00:00Z', timeZone: 'UTC' })
   assert.equal(created.status, 201)
@@ -556,7 +556,7 @@ test('metadata-only reminder edits do not overwrite concurrent cancellation/comp
   const originalFetch = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
   try {
-    async function raceMetadataPatch(concurrentPatch: { state: 'cancelled' | 'completed' } | { dueAt: string; timeZone: string }, patch: { title: string } | { dueAt: string; timeZone: string }) {
+    async function raceMetadataPatch(reminderId: string, patch: unknown, concurrentPatch: unknown, expectedState: Reminder['state'], expectedDueAt: string, concurrentDueAt = expectedDueAt) {
       let resume!: () => void, selected!: () => void
       const resumePatch = new Promise<void>(resolve => { resume = resolve })
       const reminderSelected = new Promise<void>(resolve => { selected = resolve })
@@ -596,8 +596,8 @@ test('metadata-only reminder edits do not overwrite concurrent cancellation/comp
         },
       })
       const raceEnv = { ...env, DB: raceDb, ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin }
-      async function patchReminder(value: unknown) {
-        const res = await worker.fetch(new Request(`${origin}/api/properties/${p.id}/reminders/${rid}`, {
+      async function patchReminder(reminderId: string, value: unknown) {
+        const res = await worker.fetch(new Request(`${origin}/api/properties/${p.id}/reminders/${reminderId}`, {
           method: 'PATCH',
           headers: { 'Cf-Access-Jwt-Assertion': tokens.alice, 'Content-Type': 'application/json', Origin: origin },
           body: JSON.stringify(value),
@@ -605,31 +605,27 @@ test('metadata-only reminder edits do not overwrite concurrent cancellation/comp
         return { status: res.status, data: await res.json() as Reminder }
       }
 
-      const metadataPatch = patchReminder(patch)
-      let expectedState: Reminder['state'] | undefined
+      const metadataPatch = patchReminder(reminderId, patch)
       try {
         await reminderSelected
-        const concurrent = await patchReminder(concurrentPatch)
+        const concurrent = await patchReminder(reminderId, concurrentPatch)
         assert.equal(concurrent.status, 200)
-        if ('state' in concurrentPatch) assert.equal(concurrent.data.state, concurrentPatch.state)
-        else assert.equal(concurrent.data.dueAt, '2030-02-01T10:30:00.000Z')
-        expectedState = concurrent.data.state
+        assert.equal(concurrent.data.state, expectedState)
+        assert.equal(concurrent.data.dueAt, concurrentDueAt)
       } finally {
         resume()
       }
       const edited = await metadataPatch
       assert.equal(edited.status, 200)
       assert.equal(edited.data.state, expectedState)
-      if (!('state' in concurrentPatch)) {
-        assert.equal(edited.data.title, 'Title edit under race')
-        assert.equal(edited.data.dueAt, '2030-02-01T10:30:00.000Z')
-        assert.equal(edited.data.timeZone, 'America/Los_Angeles')
-      }
+      assert.equal(edited.data.dueAt, expectedDueAt)
     }
 
-    await raceMetadataPatch({ state: 'cancelled' }, { title: 'Title edit under race' })
-    await raceMetadataPatch({ state: 'completed' }, { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' })
-    await raceMetadataPatch({ dueAt: '2030-02-01T10:30:00Z', timeZone: 'America/Los_Angeles' }, { title: 'Title edit under race' })
+    await raceMetadataPatch(rid, { title: 'Title edit under race' }, { state: 'cancelled' }, 'cancelled', '2030-01-01T00:00:00.000Z')
+    await raceMetadataPatch(rid, { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' }, { state: 'completed' }, 'completed', '2030-01-02T10:30:00.000Z', '2030-01-01T00:00:00.000Z')
+    const dueDateRace = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', { title: 'Postponement target', dueAt: '2030-01-01T00:00:00Z', timeZone: 'UTC' })
+    assert.equal(dueDateRace.status, 201)
+    await raceMetadataPatch(dueDateRace.data.id, { title: 'Title edit under postponement race' }, { dueAt: '2031-01-01T00:00:00Z' }, 'scheduled', '2031-01-01T00:00:00.000Z')
   } finally {
     globalThis.fetch = originalFetch
   }
