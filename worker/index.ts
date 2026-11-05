@@ -1,6 +1,6 @@
 import type { AIRule, Bin, Detail, Layer, LayerFeature, Note, Property, Reminder, User } from '../shared/types'
 import { authenticate, protectOrigin } from './auth'
-import { addressSelection, searchAddress } from './address'
+import { addressSelection, backfillAddresses, savedAddress, searchAddress } from './address'
 import { propertyArea } from './area'
 import { enqueueManual, jobModel, processJobs, requireAI, scheduledWork, type JobRow } from './ai'
 import { aiFields, assert, attributes, color, DEFAULT_VIEW, dueAt, HttpError, keys, object, rule, savedView, strings, text, timeZone } from './validation'
@@ -113,7 +113,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (!id && method === 'POST') {
       const b = await body(request); keys(b, ['name', 'enteredAddress', 'binId', 'tags', 'attributes', 'addressToken'])
       const enteredAddress = text(b.enteredAddress, 'enteredAddress', 1000, true)
-      const selected = await addressSelection(env, user, enteredAddress, b.addressToken)
+      const selected = b.addressToken === undefined ? await savedAddress(env, enteredAddress) : await addressSelection(env, user, enteredAddress, b.addressToken)
       const now = new Date().toISOString()
       const p: Property = { id: crypto.randomUUID(), name: text(b.name, 'name'), enteredAddress, ...selected, binId: await ownedBin(env, user, b.binId),
         tags: strings(b.tags ?? [], 'tags'), attributes: attributes(b.attributes ?? {}), creatorId: user.id, creatorStamp: user.stamp, creatorName: user.name,
@@ -158,7 +158,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         if (b.binId !== undefined) next.binId = await ownedBin(env, user, b.binId, p.creatorId)
         if (b.tags !== undefined) next.tags = strings(b.tags, 'tags')
         if (b.attributes !== undefined) next.attributes = attributes(b.attributes)
-        if (next.enteredAddress !== p.enteredAddress || b.addressToken !== undefined) Object.assign(next, await addressSelection(env, user, next.enteredAddress, b.addressToken))
+        if (b.addressToken !== undefined) Object.assign(next, await addressSelection(env, user, next.enteredAddress, b.addressToken))
+        else if (next.enteredAddress !== p.enteredAddress || (b.enteredAddress !== undefined && p.verificationStatus !== 'verified'))
+          Object.assign(next, await savedAddress(env, next.enteredAddress))
         next.version++; next.updatedBy = user.id; next.updatedAt = new Date().toISOString()
         const updated = await env.DB.prepare("UPDATE properties SET bin_id=?,updated_by=?,updated_at=?,version=?,data=? WHERE id=? AND owner_id=? AND version=? AND (owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=properties.id AND m.user_id=? AND m.role='editor')) RETURNING id,owner_id,version,data")
           .bind(next.binId, user.id, next.updatedAt, next.version, JSON.stringify(next), id, p.creatorId, b.version, user.id, user.id).first<PropertyRow>()
@@ -335,5 +337,7 @@ export default {
       return secureHeaders(response({ error: 'Internal service error' }, 500))
     }
   },
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) { ctx.waitUntil(scheduledWork(env)) },
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil((async () => { await scheduledWork(env); await backfillAddresses(env) })())
+  },
 }

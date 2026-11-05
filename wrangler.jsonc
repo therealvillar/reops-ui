@@ -21,5 +21,21 @@
     "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
     "ACCESS_TEAM_DOMAIN": "anthonyvillar.cloudflareaccess.com",
     "ACCESS_AUD": "997b58952c9e2460e1ca50a4b39b5fc5bb979653b7982448c9e79b3fe71a8919"
+  },
+  "env": {
+    "preview": {
+      "vars": {
+        "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
+        "ACCESS_TEAM_DOMAIN": "anthonyvillar.cloudflareaccess.com",
+        "ACCESS_AUD": "997b58952c9e2460e1ca50a4b39b5fc5bb979653b7982448c9e79b3fe71a8919"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "reops",
+          "database_id": "7a1cc07b-395b-4bf2-8331-ddcd740e183d"
+        }
+      ]
+    }
   }
 }

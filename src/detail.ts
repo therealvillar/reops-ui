@@ -83,7 +83,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   candidates.id = `candidates-${crypto.randomUUID()}`
   candidates.setAttribute('role', 'listbox')
   address.setAttribute('aria-controls', candidates.id)
-  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US address, city, state, and ZIP, then select a Census match. Drafts can be saved without a location.')
+  const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US street address, city, state, and ZIP. A single Census match is geocoded on save; select a result if there are multiple matches.')
   status.setAttribute('role', 'status')
   let token: string | undefined
   let selectedQuery: string | undefined
@@ -92,7 +92,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   const choose = (candidate: AddressCandidate, query: string) => {
     clearTimeout(timer)
     ++sequence
-    selectedQuery = query
+    selectedAddress = query
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
@@ -227,11 +227,11 @@ export async function openProperty(id: string, context: DetailContext): Promise<
     }, 'text-button'))
     summary.append(title, stamp(p.creatorName, p.creatorStamp))
     const verify = el('div', `verification ${p.verificationStatus}`)
-    verify.append(el('strong', '', p.verificationStatus === 'verified' ? 'Address location selected' : `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address location result available.'))
+    verify.append(el('strong', '', p.verificationStatus === 'verified' ? 'Address geocoded' : `Address ${p.verificationStatus}`), el('p', '', p.verificationMessage ?? 'No address location result available.'))
     if (p.normalizedAddress) verify.append(el('p', '', p.normalizedAddress))
     const progress = el('div', 'progress-card')
     const milestones = [Boolean(p.name && p.enteredAddress), p.verificationStatus === 'verified', detail.notes.length > 0, detail.reminders.some(r => ['scheduled', 'delivered', 'completed'].includes(r.state))]
-    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · location selected · insight noted · next step planned'))
+    progress.append(el('strong', '', `${milestones.filter(Boolean).length}/4 thoughtful steps`), el('p', 'muted', 'A record started · address geocoded · insight noted · next step planned'))
     const bar = el('progress'); bar.max = 4; bar.value = milestones.filter(Boolean).length; bar.setAttribute('aria-label', 'Useful property completion')
     progress.append(bar)
     const edit = section('Property details', 'Your creator stamp stays with this record, wherever it goes.')
@@ -306,7 +306,7 @@ export async function openProperty(id: string, context: DetailContext): Promise<
 
 function areaSection(property: Property): HTMLElement {
   const section = el('section', 'detail-section')
-  section.append(el('h3', '', 'Nearby public data'), el('p', 'muted', 'Read-only public records within 500 meters of the selected Census location. Choose the county containing the property. These records are not a title, flood-risk, zoning, or legal determination. Loading shares the location with the selected public data providers.'))
+  section.append(el('h3', '', 'Nearby public data'), el('p', 'muted', 'Read-only public records within 500 meters of the geocoded Census location. Choose the county containing the property. These records are not a title, flood-risk, zoning, or legal determination. Loading shares the location with the selected public data providers.'))
   const county = select('area-county', [
     { value: 'philadelphia', label: 'Philadelphia' }, { value: 'montgomery', label: 'Montgomery' },
     { value: 'bucks', label: 'Bucks' }, { value: 'delaware', label: 'Delaware' },

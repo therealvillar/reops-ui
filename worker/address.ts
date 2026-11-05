@@ -6,7 +6,8 @@ import { assert, HttpError, text } from './validation'
 const encoder = new TextEncoder()
 const provider = 'US Census Geocoder'
 const benchmark = 'Public_AR_Current'
-const matchMessage = 'US Census street-interpolated match, not rooftop accuracy or legal address validation. Explicit selection enables map coordinates.'
+const accuracyMessage = 'US Census street-interpolated match, not rooftop accuracy or legal address validation.'
+const matchMessage = `${accuracyMessage} Explicit selection enables map coordinates.`
 type Match = { matched_address: string; latitude: number; longitude: number }
 function normalizedQuery(query: string) {
   // Keep punctuation, unit identifiers, and street suffixes distinct.
@@ -39,11 +40,10 @@ async function censusResponse(response: Response) {
   } finally { reader.releaseLock() }
 }
 function signingKey(env: Env) {
-  if (!env.ADDRESS_TOKEN_SECRET || env.ADDRESS_TOKEN_SECRET.length < 32) throw new HttpError(503, 'Address selection signing is not configured; save an unverified draft')
+  if (!env.ADDRESS_TOKEN_SECRET || env.ADDRESS_TOKEN_SECRET.length < 32) throw new HttpError(503, 'Address selection signing is not configured; unique addresses can still geocode on save, or save an unverified draft')
   return encoder.encode(env.ADDRESS_TOKEN_SECRET)
 }
-export async function searchAddress(env: Env, user: User, query: string): Promise<{ candidates: AddressCandidate[]; message: string }> {
-  const key = signingKey(env)
+async function censusMatches(env: Env, query: string): Promise<Match[]> {
   const cacheKey = normalizedQuery(query)
   const cached = await env.DB.prepare('SELECT matched_address,latitude,longitude FROM property_gps WHERE normalized_query=? AND provider=? AND benchmark=? ORDER BY match_order,matched_address')
     .bind(cacheKey, provider, benchmark).all<Match>()
@@ -77,6 +77,45 @@ export async function searchAddress(env: Env, user: User, query: string): Promis
           .bind(alias, match.matched_address, match.latitude, match.longitude, provider, benchmark, fetchedAt, index))))
     }
   }
+  return matches
+}
+type Location = Pick<Property, 'normalizedAddress' | 'verificationStatus' | 'verificationMessage' | 'latitude' | 'longitude'>
+const unlocated = (status: Property['verificationStatus'], message: string): Location => ({
+  normalizedAddress: null, verificationStatus: status, verificationMessage: message, latitude: null, longitude: null,
+})
+export async function geocodeAddress(env: Env, address: string): Promise<Location> {
+  if (!address.trim()) return unlocated('unverified', 'No address entered. Add a complete US street address to locate this property.')
+  const matches = await censusMatches(env, address)
+  if (!matches.length) return unlocated('failed', 'No valid US Census matches found. Refine the address and save it again.')
+  if (matches.length > 1) return unlocated('ambiguous', 'Multiple US Census matches found. Select the correct address in the property editor.')
+  const match = matches[0]
+  return { normalizedAddress: match.matched_address, verificationStatus: 'verified',
+    verificationMessage: `${accuracyMessage} Automatically geocoded from a single match.`,
+    latitude: match.latitude, longitude: match.longitude }
+}
+export async function savedAddress(env: Env, address: string): Promise<Location> {
+  try { return await geocodeAddress(env, address) } catch (error) {
+    if (error instanceof HttpError && error.status === 502) return unlocated('unverified', `${error.message}. Geocoding will retry automatically.`)
+    throw error
+  }
+}
+export async function backfillAddresses(env: Env): Promise<void> {
+  const rows = await env.DB.prepare("SELECT id,version,data FROM properties WHERE json_extract(data,'$.verificationStatus')='unverified' AND json_extract(data,'$.latitude') IS NULL AND length(trim(json_extract(data,'$.enteredAddress')))>0 ORDER BY created_at,id LIMIT 5")
+    .all<{ id: string; version: number; data: string }>()
+  const results = await Promise.allSettled(rows.results.map(async row => {
+    const property = JSON.parse(row.data) as Property
+    const location = await geocodeAddress(env, property.enteredAddress)
+    const updatedAt = new Date().toISOString()
+    const next: Property = { ...property, ...location, version: property.version + 1, updatedBy: 'system:geocoder', updatedAt }
+    await env.DB.prepare("UPDATE properties SET version=?,updated_by=?,updated_at=?,data=? WHERE id=? AND version=? AND json_extract(data,'$.verificationStatus')='unverified'")
+      .bind(next.version, next.updatedBy, next.updatedAt, JSON.stringify(next), row.id, row.version).run()
+  }))
+  const failed = results.find(result => result.status === 'rejected')
+  if (failed?.status === 'rejected') throw failed.reason
+}
+export async function searchAddress(env: Env, user: User, query: string): Promise<{ candidates: AddressCandidate[]; message: string }> {
+  const key = signingKey(env)
+  const matches = await censusMatches(env, query)
   const candidates = await Promise.all(matches.map(async match => {
     const { matched_address: normalized, latitude, longitude } = match
     const token = await new SignJWT({ query, normalized, latitude, longitude, verified: true, message: matchMessage })
