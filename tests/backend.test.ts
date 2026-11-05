@@ -982,6 +982,35 @@ test('AI needs explicit opt-in, creates deduplicated snapshots, never changes re
   } finally { globalThis.fetch = originalFetch }
 })
 
+test('name-only automatic AI consent does not share the address of a property without a legacy name', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  const previousRule = (await api('ai-default-rule')).data
+  try {
+    aiCalls = []
+    const nameOnly = { enabled: true, triggers: ['creation'], watchedFields: [], fields: ['name'] }
+    assert.equal((await api('ai-default-rule', 'PUT', nameOnly)).status, 200)
+    const missingName = await api<Property>('properties', 'POST', { enteredAddress: 'Single match', binId: bin.id, allowDuplicate: true })
+    assert.equal(missingName.status, 201)
+    assert.equal(missingName.data.name, undefined)
+    await processJobs(env)
+    assert.equal(aiCalls.length, 1)
+    assert.deepEqual(aiCalls[0].fields, ['name'])
+    assert.deepEqual(aiCalls[0].record, {})
+
+    assert.equal((await api('ai-default-rule', 'PUT', { ...nameOnly, fields: ['enteredAddress', 'normalizedAddress'] })).status, 200)
+    const authorized = await api<Property>('properties', 'POST', { enteredAddress: 'Single match', binId: bin.id, allowDuplicate: true })
+    assert.equal(authorized.status, 201)
+    await processJobs(env)
+    assert.equal(aiCalls.length, 2)
+    assert.deepEqual(aiCalls[1].fields, ['enteredAddress', 'normalizedAddress'])
+    assert.deepEqual(aiCalls[1].record, { enteredAddress: 'Single match', normalizedAddress: authorized.data.normalizedAddress })
+  } finally {
+    globalThis.fetch = originalFetch
+    await api('ai-default-rule', 'PUT', previousRule)
+  }
+})
+
 test('oversized AI provider streams are cancelled before full buffering or decoding', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
