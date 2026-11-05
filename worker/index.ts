@@ -11,6 +11,7 @@ export interface Env {
   ACCESS_TEAM_DOMAIN?: string
   ACCESS_AUD?: string
   APP_ORIGIN?: string
+  PREVIEW_WORKER_HOSTNAME?: string
   DEV_AUTH?: string
   ADDRESS_TOKEN_SECRET?: string
   BUCKS_PARCELS_ENABLED?: string

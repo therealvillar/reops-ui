@@ -24,7 +24,7 @@
   },
   "previews": {
     "vars": {
-      "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
+      "PREVIEW_WORKER_HOSTNAME": "reops-ui.anthonyrvillar.workers.dev",
       "ACCESS_TEAM_DOMAIN": "anthonyvillar.cloudflareaccess.com",
       "ACCESS_AUD": "997b58952c9e2460e1ca50a4b39b5fc5bb979653b7982448c9e79b3fe71a8919"
     },
@@ -38,7 +38,7 @@
   "env": {
     "preview": {
       "vars": {
-        "APP_ORIGIN": "https://reops-ui.anthonyrvillar.workers.dev",
+        "APP_ORIGIN": "https://reops-ui-preview.anthonyrvillar.workers.dev",
         "ACCESS_TEAM_DOMAIN": "anthonyvillar.cloudflareaccess.com",
         "ACCESS_AUD": "997b58952c9e2460e1ca50a4b39b5fc5bb979653b7982448c9e79b3fe71a8919"
       },
