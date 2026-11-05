@@ -187,19 +187,23 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           assert(old, 'Reminder not found', 404)
           const b = await body(request); keys(b, ['title', 'dueAt', 'timeZone', 'state'])
           assert(Object.keys(b).length > 0, 'Include at least one reminder field')
-          if (b.title !== undefined) old.title = text(b.title, 'reminder title', 500)
-          if (b.dueAt !== undefined) old.due_at = dueAt(b.dueAt)
-          if (b.timeZone !== undefined) old.time_zone = timeZone(b.timeZone)
+          const title = b.title !== undefined ? text(b.title, 'reminder title', 500) : null
+          const dueAtValue = b.dueAt !== undefined ? dueAt(b.dueAt) : null
+          const timeZoneValue = b.timeZone !== undefined ? timeZone(b.timeZone) : null
+          let nextState: Reminder['state'] | undefined
           if (b.state !== undefined) {
             assert(['completed', 'cancelled', 'scheduled'].includes(b.state as string), 'Only scheduled, completed, or cancelled can be selected; delivery is server-controlled')
-            assert(!(old.state === 'delivered' && b.state === 'scheduled'), 'Create a new reminder to schedule another delivery', 409)
-            const delivered = await env.DB.prepare('SELECT id FROM notifications WHERE reminder_id=?').bind(subId).first()
-            assert(!(delivered && b.state === 'scheduled'), 'Create a new reminder to schedule another delivery', 409)
-            old.state = b.state as Reminder['state']
+            nextState = b.state as Reminder['state']
           }
-          const updated = await env.DB.prepare("UPDATE reminders SET title=?,due_at=?,time_zone=?,state=CASE WHEN state='delivered' AND ?='scheduled' THEN state ELSE ? END,error=NULL,updated_by=? WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))) RETURNING *")
-            .bind(old.title, old.due_at, old.time_zone, old.state, old.state, user.id, subId, id, user.id, user.id).first<ReminderRow>()
-          assert(updated, 'Property access changed; reload', 403)
+          const updated = await env.DB.prepare("UPDATE reminders SET title=CASE WHEN ? IS NULL THEN title ELSE ? END,due_at=CASE WHEN ? IS NULL THEN due_at ELSE ? END,time_zone=CASE WHEN ? IS NULL THEN time_zone ELSE ? END,state=CASE WHEN ? IS NULL THEN state WHEN state='delivered' AND ?='scheduled' THEN state ELSE ? END,error=NULL,updated_by=? WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))) AND (? != 'scheduled' OR (state != 'delivered' AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.reminder_id=reminders.id))) RETURNING *")
+            .bind(title, title, dueAtValue, dueAtValue, timeZoneValue, timeZoneValue, nextState ?? null, nextState ?? null, nextState ?? null, user.id, subId, id, user.id, user.id, nextState ?? '').first<ReminderRow>()
+          if (!updated) {
+            const canEdit = await env.DB.prepare('SELECT p.id FROM properties p LEFT JOIN property_members m ON m.property_id=p.id AND m.user_id=? WHERE p.id=? AND (p.owner_id=? OR m.role=\'editor\')')
+              .bind(user.id, id, user.id).first()
+            assert(canEdit, 'Property access changed; reload', 403)
+            assert(nextState !== 'scheduled', 'Create a new reminder to schedule another delivery', 409)
+            throw new HttpError(409, 'Reminder changed. Reload before saving.')
+          }
           return response(reminderModel(updated))
         }
       }

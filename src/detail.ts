@@ -89,10 +89,10 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   let selectedAddress: string | undefined
   let sequence = 0
   let timer: ReturnType<typeof setTimeout>
-  const choose = (candidate: AddressCandidate) => {
+  const choose = (candidate: AddressCandidate, query: string) => {
     clearTimeout(timer)
     ++sequence
-    selectedAddress = address.value
+    selectedAddress = query
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
@@ -114,7 +114,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
         if (current !== sequence || !address.isConnected) return
         status.textContent = result.message
         for (const candidate of result.candidates) {
-          const option = button(candidate.label, () => choose(candidate), 'address-option')
+          const option = button(candidate.label, () => choose(candidate, query), 'address-option')
           option.setAttribute('role', 'option')
           option.setAttribute('aria-selected', 'false')
           option.addEventListener('keydown', event => {

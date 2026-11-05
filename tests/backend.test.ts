@@ -7,7 +7,7 @@ import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
-import type { Env } from '../worker/index'
+import worker, { type Env } from '../worker/index'
 import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, PropertyArea, Reminder, SavedView, User } from '../shared/types'
 
 let mf: Miniflare, db: D1Database, env: Env
@@ -545,6 +545,90 @@ test('cron reminder delivery has atomic persisted notifications, stable authors,
   assert.equal((await api(`properties/${p.id}/reminders/${rid}`, 'PATCH', { state: 'scheduled' })).status, 409)
   await assert.rejects(db.prepare("UPDATE reminders SET created_by='bob' WHERE id=?").bind(rid).run(), /immutable reminder/)
   await api(`properties/${p.id}/members/${encodeURIComponent(bob.id)}`, 'DELETE')
+})
+
+test('metadata-only reminder edits preserve concurrent reminder fields', async () => {
+  const p = await createProperty('Reminder race safety')
+  const created = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', { title: 'Race target', dueAt: '2030-01-01T00:00:00Z', timeZone: 'UTC' })
+  assert.equal(created.status, 201)
+  const rid = created.data.id
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    async function raceMetadataPatch(reminderId: string, patch: unknown, concurrentPatch: unknown, expectedState: Reminder['state'], expectedDueAt: string, concurrentDueAt = expectedDueAt) {
+      let resume!: () => void, selected!: () => void
+      const resumePatch = new Promise<void>(resolve => { resume = resolve })
+      const reminderSelected = new Promise<void>(resolve => { selected = resolve })
+      let shouldPause = true
+      const raceDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== 'prepare') {
+            const value = Reflect.get(target, property, target)
+            return typeof value === 'function' ? value.bind(target) : value
+          }
+          return (sql: string) => {
+            const statement = target.prepare(sql)
+            if (sql !== 'SELECT * FROM reminders WHERE id=? AND property_id=?') return statement
+            return {
+              bind(...values: unknown[]) {
+                const bound = statement.bind(...values)
+                return new Proxy(bound, {
+                  get(statementTarget, statementProperty) {
+                    if (statementProperty !== 'first') {
+                      const value = Reflect.get(statementTarget, statementProperty, statementTarget)
+                      return typeof value === 'function' ? value.bind(statementTarget) : value
+                    }
+                    return async <T>() => {
+                      const result = await statementTarget.first<T>()
+                      if (shouldPause) {
+                        shouldPause = false
+                        selected()
+                        await resumePatch
+                      }
+                      return result
+                    }
+                  },
+                })
+              },
+            } as D1PreparedStatement
+          }
+        },
+      })
+      const raceEnv = { ...env, DB: raceDb, ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com', ACCESS_AUD: 'test-audience', APP_ORIGIN: origin }
+      async function patchReminder(reminderId: string, value: unknown) {
+        const res = await worker.fetch(new Request(`${origin}/api/properties/${p.id}/reminders/${reminderId}`, {
+          method: 'PATCH',
+          headers: { 'Cf-Access-Jwt-Assertion': tokens.alice, 'Content-Type': 'application/json', Origin: origin },
+          body: JSON.stringify(value),
+        }), raceEnv, {} as ExecutionContext)
+        return { status: res.status, data: await res.json() as Reminder }
+      }
+
+      const metadataPatch = patchReminder(reminderId, patch)
+      try {
+        await reminderSelected
+        const concurrent = await patchReminder(reminderId, concurrentPatch)
+        assert.equal(concurrent.status, 200)
+        assert.equal(concurrent.data.state, expectedState)
+        assert.equal(concurrent.data.dueAt, concurrentDueAt)
+      } finally {
+        resume()
+      }
+      const edited = await metadataPatch
+      assert.equal(edited.status, 200)
+      assert.equal(edited.data.state, expectedState)
+      assert.equal(edited.data.dueAt, expectedDueAt)
+    }
+
+    await raceMetadataPatch(rid, { title: 'Title edit under race' }, { state: 'cancelled' }, 'cancelled', '2030-01-01T00:00:00.000Z')
+    await raceMetadataPatch(rid, { dueAt: '2030-01-02T10:30:00Z', timeZone: 'UTC' }, { state: 'completed' }, 'completed', '2030-01-02T10:30:00.000Z', '2030-01-01T00:00:00.000Z')
+    const dueDateRace = await api<Reminder>(`properties/${p.id}/reminders`, 'POST', { title: 'Postponement target', dueAt: '2030-01-01T00:00:00Z', timeZone: 'UTC' })
+    assert.equal(dueDateRace.status, 201)
+    await raceMetadataPatch(dueDateRace.data.id, { title: 'Title edit under postponement race' }, { dueAt: '2031-01-01T00:00:00Z' }, 'scheduled', '2031-01-01T00:00:00.000Z')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('pending AI execution rechecks collaborator grants and current automatic rule consent before sending', async () => {
