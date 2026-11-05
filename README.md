@@ -7,7 +7,7 @@ A TypeScript property-record workspace deployed as a Cloudflare Worker with D1 p
 - **Frontend:** vanilla TypeScript, Vite, and Leaflet. No framework existed in the original workspace. Property data and preferences are not persisted in browser storage. An empty map starts over Philadelphia; populated maps fit their locations.
 - **Backend:** Cloudflare Workers and D1, signed Cloudflare Access identity, server-side address and AI adapters, and a once-per-minute Cron Trigger.
 - **Access:** private records by default, owned by a stable authenticated user ID. Owners can explicitly grant viewer/editor access to another registered user's exact ID. Stamps are display identifiers, never authentication credentials. Editors preserve the original creator; viewers cannot mutate records.
-- **Addresses:** US Census geocoding is free, keyless, and US-only. An address remains a draft until a user explicitly selects a signed match. The legacy `verified` status means a selected geocoded match, not USPS, rooftop, occupancy, or legal address verification. Census coordinates can be interpolated along a street.
+- **Addresses:** US Census geocoding is free, keyless, and US-only. A single valid match is geocoded and stored with the property on save; multiple matches require explicit selection of a signed candidate. The legacy `verified` status means a geocoded match, not USPS, rooftop, occupancy, or legal address verification. Census coordinates can be interpolated along a street.
 - **Reminders:** timestamps are stored as UTC instants with an IANA time-zone label. Enter an explicit UTC offset matching that zone to disambiguate daylight-saving transitions. Cron delivers durable in-app notifications without an open tab; the browser polls for delivery. Editing a delivered reminder does not reschedule it—create a new reminder for another alarm. No email/SMS channel is configured.
 - **AI:** read-only analysis by default. Manual actions and opted-in automatic rules share only selected fields. Results are not executed as instructions and cannot modify records or invoke tools.
 - **Visual reference:** `therealvillar/newwest-calendar` returned 404 during inspection. The interface uses an independent accessible neutral design; screenshots or source files are needed to match that reference.
@@ -49,7 +49,7 @@ The tests exercise the Worker against an isolated D1 runtime and frontend state 
 5. Do **not** set `DEV_AUTH` on the deployed Worker. The API must fail closed when production identity configuration is missing.
 6. Apply migrations: `npm run db:remote`.
 7. Configure optional server-side secrets below; then `npm run deploy`.
-8. Check the deployed Access login, create an unverified draft, verify an address if configured, move a card, and schedule a near-term reminder. Check Worker logs and Cron events for delivery. Cron changes can take several minutes to propagate.
+8. Check the deployed Access login, create a property with a full US address and confirm its coordinates in D1, move a card, and schedule a near-term reminder. Check Worker logs and Cron events for delivery and address backfill. Cron changes can take several minutes to propagate.
 
 For a first release on `workers.dev`, obtain the account's existing Workers subdomain from Cloudflare and use the exact `reops-ui.<subdomain>.workers.dev` hostname for both `APP_ORIGIN` and the Access application. Protect only this application, not all Workers on the account. Start with an allow policy for the verified account owner's exact email, not an entire domain or everyone. Workers/D1 deployment permission alone does not grant Access application management permission: an Access API `403 auth.forbidden` requires an authorized administrator to configure Access before deployment. Do not deploy a placeholder with incomplete identity settings or enable development authentication as a substitute.
 
@@ -57,7 +57,7 @@ The initial release target, confirmed by the account's Workers subdomain API, is
 
 The first iteration is deployed at **https://reops-ui.anthonyrvillar.workers.dev** behind hostname-scoped Cloudflare Access. The user-authorized management profile resolved the earlier Access permission blocker. The application allows only the verified account owner's exact email; its actual team domain and audience are configured. Anonymous requests to the root, HTML, JavaScript asset, and API redirect to Access login. Preview URLs are disabled so alternate version hostnames cannot serve an unprotected copy. Production `DEV_AUTH` is absent, the existing D1 database is preserved, and no paid upgrade or unrelated Access policy change was made.
 
-Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Address selection requires a server-side signing secret, and AI requires the optional credentials documented below.
+Authenticated production flow checks require the allowed user to sign in through Access; an anonymous redirect check alone does not verify record editing or reminder delivery. Selecting among multiple address matches requires a server-side signing secret; single-match geocoding does not. AI requires the optional credentials documented below.
 
 Automated production-mode integration coverage runs the real Worker bundle against isolated D1 with locally generated RSA keys and mock JWKS, without `DEV_AUTH`. It verifies that valid issuer/audience assertions reach the D1 identity API and a file-backed `ASSETS` service serving repository HTML/CSS, while missing, malformed, wrong-issuer, and wrong-audience assertions reject both asset and API requests. This checks Worker authentication and asset-binding delegation, not a real browser login or Cloudflare's internal static-asset router. The deployed version and bindings, remote migration ledger, exact-owner Access policy, and anonymous production redirects were also checked independently.
 
@@ -67,15 +67,15 @@ Never put API keys in `VITE_*` variables, source files, `wrangler.jsonc`, or com
 
 ### Addresses
 
-All property creation/editing flows use the server-side US Census Bureau geocoder at `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` with the current public benchmark. Enter a complete US street address, city, state, and ZIP for best results; this is not a partial-address autocomplete provider. No geocoding API key is needed.
+Property creation and address edits use the server-side US Census Bureau geocoder at `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` with the current public benchmark. Enter a complete US street address, city, state, and ZIP for best results; this is not a partial-address autocomplete provider. A single valid match is saved automatically with coordinates in the property's D1 JSON record. Multiple matches remain unlocated until a signed match is selected. No match or an upstream failure leaves the property unlocated with an explanatory status; blank-address drafts remain possible. No geocoding API key is needed.
 
 ```sh
 npx wrangler secret put ADDRESS_TOKEN_SECRET
 ```
 
-Use a cryptographically random signing secret of at least 32 bytes for candidate tokens. No coordinates or verification claims supplied by a browser are trusted. Without the signing secret users can still save unverified drafts; lookup errors are shown explicitly. Selecting a match preserves the entered address and separately saves the normalized address.
+Use a cryptographically random signing secret of at least 32 bytes for candidate tokens. No coordinates or verification claims supplied by a browser are trusted. Without the signing secret, single-match addresses can still geocode on save but users cannot select among multiple results. Lookup errors are shown explicitly. Selecting a match preserves the entered address and separately saves the normalized address.
 
-Apply the new `0005_property_gps.sql` migration before using address lookup (`npm run db:local` or, after backing up production, `npm run db:remote`). The D1 `property_gps` table stores public geocoding results, not ownership or private property attributes. Address lookup checks this cache before calling Census. Existing property records are preserved; select a Census match when editing an older record to update its location. Remove the obsolete `ADDRESS_API_KEY` deployment secret if present.
+Apply migrations before using address lookup (`npm run db:local` or, after backing up production, `npm run db:remote`). The D1 `property_gps` table caches public geocoding results, while the property row stores its selected coordinates and status. Address lookup checks this cache before calling Census. The minute-scheduled worker backfills up to five older unlocated properties per run, attributing changes to `system:geocoder` and preserving their edit history; ambiguous or unmatched addresses remain unlocated with instructions to refine or select a result. Provider outages are retried on later scheduled runs. Remove the obsolete `ADDRESS_API_KEY` deployment secret if present.
 
 ### Nearby public data
 

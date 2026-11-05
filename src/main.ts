@@ -251,14 +251,14 @@ function renderContent(): void {
   const filtered = filterProperties(properties, view)
   const verified = properties.filter(p => p.verificationStatus === 'verified').length
   const ungeocoded = properties.filter(p => !isMappable(p)).length
-  const nextMilestone = properties.length === 0 ? 'Add your first property' : verified === 0 ? 'Select an address location' : 'Keep the next step in sight'
+  const nextMilestone = properties.length === 0 ? 'Add your first property' : verified === 0 ? 'Geocode an address' : 'Keep the next step in sight'
   welcome.replaceChildren()
   const welcomeText = el('div')
   welcomeText.append(el('p', 'eyebrow', 'YOUR FIELD GUIDE'), el('h2', '', properties.length ? 'A little progress, a little perspective.' : `Welcome, ${user.name.split(' ')[0]}. Let’s make room for progress.`),
-    el('p', '', properties.length ? 'A geocoded address and a useful note beat a hundred busy edits. Open a dossier to capture both.' : 'Start with one property. Select its address location, leave a field note, and plan what comes next.'))
+    el('p', '', properties.length ? 'A geocoded address and a useful note beat a hundred busy edits. Open a dossier to capture both.' : 'Start with one property. Add a complete US address, leave a field note, and plan what comes next.'))
   const welcomeSteps = el('div', 'welcome-steps')
   welcomeSteps.append(el('span', `step ${properties.length ? 'done' : ''}`, `${properties.length ? '✓' : '1'} Record started`),
-    el('span', `step ${verified ? 'done' : ''}`, `${verified ? '✓' : '2'} Location selected`),
+    el('span', `step ${verified ? 'done' : ''}`, `${verified ? '✓' : '2'} Address geocoded`),
     button(nextMilestone + ' ↗', properties.length ? () => { void open(properties.find(p => p.verificationStatus !== 'verified')?.id ?? properties[0].id) } : add, 'text-button'))
   welcome.append(welcomeText, welcomeSteps)
   metrics.replaceChildren()
@@ -288,7 +288,7 @@ function renderContent(): void {
         ? 'Enable Properties in the map legend to show these locations, or choose a reference layer.'
         : hasReferenceLocations
         ? 'Reference locations are hidden by the active filters. Clear filters or enable a compatible layer. Unlocated drafts remain available in Table and Board.'
-        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Select an address location in the dossier to add a map location.' : 'Add a property or clear filters to start exploring.'), button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
+        : filtered.length ? 'Your unlocated drafts are safe in Table and Board. Add a complete address or select a Census match in the dossier to locate a property.' : 'Add a property or clear filters to start exploring.'), button('Open table', () => { mode = 'table'; renderContent() }, 'button small'))
       content.append(empty)
     }
   } else {

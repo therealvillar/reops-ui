@@ -21,6 +21,7 @@ const origin = 'https://app.example.com'
 const issuer = 'https://test-team.cloudflareaccess.com'
 const signingSecret = 'test-only-address-signing-secret-32-characters'
 const censusCalls: string[] = []
+let censusFailures = 0
 let cartoCalls = 0
 
 async function upstream(request: Request): Promise<Response> {
@@ -48,6 +49,10 @@ async function upstream(request: Request): Promise<Response> {
       { matchedAddress: 'Out of bounds', coordinates: { x: -181, y: 91 } },
       { matchedAddress: 'String coordinates', coordinates: { x: '-73.2', y: '40.1' } },
       { matchedAddress: 'Missing coordinate', coordinates: { x: -73.2 } },
+    ] } })
+    if (query === 'Retry match' && censusFailures > 0) { censusFailures--; return new Response('unavailable', { status: 503 }) }
+    if (query === 'Retry match') return Response.json({ result: { addressMatches: [
+      { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 } },
     ] } })
     if (query === 'Single match') return Response.json({ result: { addressMatches: [
       { matchedAddress: '456 OAK ST, SPRINGFIELD, NY, 12345', coordinates: { x: -72.3, y: 41.2 } },
@@ -291,9 +296,10 @@ test('explicit viewer/editor grants allow collaboration while preserving the ori
   assert.equal((await api<Detail>(`properties/${p.id}`)).data.history.some(h => h.action === 'member_removed'), true)
 })
 
-test('entered drafts are preserved; only explicitly selected signed provider candidates get coordinates', async () => {
+test('ambiguous addresses stay unlocated until a signed provider candidate is selected', async () => {
   const p = await createProperty('Address draft')
-  assert.equal(p.enteredAddress, '123 Main'); assert.equal(p.verificationStatus, 'unverified'); assert.equal(p.latitude, null)
+  assert.equal(p.enteredAddress, '123 Main'); assert.equal(p.verificationStatus, 'ambiguous'); assert.equal(p.latitude, null)
+  assert.match(p.verificationMessage!, /Multiple US Census matches/)
   assert.equal((await api('properties', 'POST', { name: 'Forged', enteredAddress: 'x', binId: bin.id, latitude: 42, verificationStatus: 'verified' })).status, 400)
   const search = await api<{ candidates: AddressCandidate[]; message: string }>('addresses/search', 'POST', { query: '123 Main' })
   assert.equal(search.status, 200)
@@ -312,13 +318,78 @@ test('entered drafts are preserved; only explicitly selected signed provider can
   const bobBins = (await api<Bin[]>('bins', 'GET', undefined, 'bob')).data
   assert.equal((await api('properties', 'POST', { name: 'Borrow token', enteredAddress: '123 Main', binId: bobBins[0].id, addressToken: search.data.candidates[0].token }, 'bob')).status, 400)
   const moved = await api<Property>(`properties/${p.id}`, 'PATCH', { version: 2, enteredAddress: 'Changed' })
-  assert.equal(moved.data.latitude, null); assert.equal(moved.data.verificationStatus, 'unverified')
+  assert.equal(moved.data.latitude, null); assert.equal(moved.data.verificationStatus, 'ambiguous')
   const secondMatch = await createProperty('Selected second Census match', { addressToken: search.data.candidates[1].token })
   assert.equal(secondMatch.verificationStatus, 'verified'); assert.equal(secondMatch.latitude, 41.2)
   assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === secondMatch.id), true)
   const expiredToken = await new SignJWT({ query: '123 Main', normalized: 'Fake', latitude: 1, longitude: 2, verified: true })
     .setProtectedHeader({ alg: 'HS256' }).setSubject(user.id).setIssuer('reops-address').setAudience('property-selection').setIssuedAt().setExpirationTime(1).sign(new TextEncoder().encode(signingSecret))
   assert.equal((await api('properties', 'POST', { name: 'Expired', enteredAddress: '123 Main', binId: bin.id, addressToken: expiredToken })).status, 400)
+})
+
+test('unique matches are automatically geocoded on create and address edits, then persisted in D1', async () => {
+  const created = await createProperty('Automatically located', { enteredAddress: 'Single match' })
+  assert.equal(created.verificationStatus, 'verified')
+  assert.equal(created.enteredAddress, 'Single match')
+  assert.equal(created.normalizedAddress, '456 OAK ST, SPRINGFIELD, NY, 12345')
+  assert.equal(created.latitude, 41.2); assert.equal(created.longitude, -72.3)
+  assert.match(created.verificationMessage!, /Automatically geocoded/)
+  const stored = await db.prepare('SELECT data FROM properties WHERE id=?').bind(created.id).first<{ data: string }>()
+  assert.deepEqual(JSON.parse(stored!.data), created)
+  assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === created.id), true)
+
+  const draft = await createProperty('Empty address draft', { enteredAddress: '' })
+  assert.equal(draft.verificationStatus, 'unverified')
+  assert.equal(draft.latitude, null)
+  const edited = await api<Property>(`properties/${draft.id}`, 'PATCH', { version: draft.version, enteredAddress: 'Single match' })
+  assert.equal(edited.status, 200); assert.equal(edited.data.latitude, 41.2)
+  assert.equal(edited.data.normalizedAddress, created.normalizedAddress)
+  const untouched = await api<Property>(`properties/${created.id}`, 'PATCH', { version: created.version, name: 'Updated name' })
+  assert.equal(untouched.data.verificationStatus, 'verified')
+  assert.equal(untouched.data.latitude, created.latitude)
+  assert.equal(untouched.data.longitude, created.longitude)
+})
+
+test('scheduled work backfills old unlocated properties without changing already located records', async () => {
+  const draft = await createProperty('Legacy address', { enteredAddress: '' })
+  await db.prepare("UPDATE properties SET data=json_set(data,'$.enteredAddress',?) WHERE id=?").bind('Single match', draft.id).run()
+  let work!: Promise<unknown>
+  await worker.scheduled({} as ScheduledController, env, { waitUntil(promise) { work = promise } } as ExecutionContext)
+  await work
+  const located = (await api<Detail>(`properties/${draft.id}`)).data
+  assert.equal(located.property.verificationStatus, 'verified')
+  assert.equal(located.property.latitude, 41.2)
+  assert.equal(located.property.version, draft.version + 1)
+  assert.equal(located.property.updatedBy, 'system:geocoder')
+  assert.equal(located.history.at(-1)?.actorStamp, 'SYSTEM-GEOCODER')
+  assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === draft.id), true)
+  await worker.scheduled({} as ScheduledController, env, { waitUntil(promise) { work = promise } } as ExecutionContext)
+  await work
+  assert.equal((await api<Detail>(`properties/${draft.id}`)).data.property.version, draft.version + 1)
+  assert.equal((await api<Detail>(`properties/${draft.id}`)).data.history.length, located.history.length)
+})
+
+test('scheduled geocoding retries provider outages without saving false coordinates', async () => {
+  const draft = await createProperty('Retry old address', { enteredAddress: '' })
+  await db.prepare("UPDATE properties SET data=json_set(data,'$.enteredAddress',?) WHERE id=?").bind('Retry match', draft.id).run()
+  censusFailures = 1
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => upstream(new Request(input, init))) as typeof fetch
+  try {
+    let work!: Promise<unknown>
+    await worker.scheduled({} as ScheduledController, env, { waitUntil(promise) { work = promise } } as ExecutionContext)
+    await assert.rejects(work, /geocoding unavailable/)
+    assert.equal(censusFailures, 0)
+    assert.equal(censusCalls.at(-1), 'Retry match')
+    assert.equal((await api<Detail>(`properties/${draft.id}`)).data.property.verificationStatus, 'unverified')
+    assert.equal(await db.prepare("SELECT count(*) AS count FROM property_gps WHERE normalized_query='RETRY MATCH'").first('count'), 0)
+    await worker.scheduled({} as ScheduledController, env, { waitUntil(promise) { work = promise } } as ExecutionContext)
+    await work
+    const located = (await api<Detail>(`properties/${draft.id}`)).data.property
+    assert.equal(located.verificationStatus, 'verified')
+    assert.equal(located.latitude, 41.2)
+    assert.equal(located.version, draft.version + 1)
+  } finally { globalThis.fetch = originalFetch }
 })
 
 test('Census cache reuses conservatively normalized queries and canonical single-match aliases without fetching', async () => {
@@ -378,7 +449,8 @@ test('Census no/invalid matches and provider failures never become successful ca
     assert.equal(censusCalls.length, beforeCalls + 2)
     assert.equal(await db.prepare('SELECT COUNT(*) AS count FROM property_gps WHERE normalized_query=?').bind(query.toUpperCase()).first('count'), 0)
     const draft = await createProperty(query, { enteredAddress: query })
-    assert.equal(draft.verificationStatus, 'unverified')
+    assert.equal(draft.verificationStatus, query === 'No matches' || query === 'Invalid matches' ? 'failed' : 'unverified')
+    assert.match(draft.verificationMessage!, query === 'No matches' || query === 'Invalid matches' ? /No valid US Census matches/ : /geocoding unavailable.*retry automatically/i)
     assert.equal(draft.latitude, null)
     assert.equal((await api<{ propertyId?: string }[]>('layers/properties/features')).data.some(feature => feature.propertyId === draft.id), false)
   }
@@ -838,7 +910,7 @@ test('local development bypass is explicit and impossible on remote requests or 
     const bins = await (await local.dispatchFetch('http://localhost/api/bins')).json() as Bin[]
     const unavailable = await local.dispatchFetch('http://localhost/api/addresses/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"query":"123 Main"}' })
     assert.equal(unavailable.status, 503); assert.match(JSON.stringify(await unavailable.json()), /unverified draft/)
-    const draft = await local.dispatchFetch('http://localhost/api/properties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Provider unavailable draft', enteredAddress: 'User input', binId: bins[0].id }) })
+    const draft = await local.dispatchFetch('http://localhost/api/properties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty address draft', enteredAddress: '', binId: bins[0].id }) })
     assert.equal(draft.status, 201)
     const draftProperty = await draft.json() as Property
     assert.equal(draftProperty.verificationStatus, 'unverified')
