@@ -86,13 +86,13 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
   const status = el('p', 'muted address-status', property?.verificationMessage ?? 'Enter a complete US street address, city, state, and ZIP. A single Census match is geocoded on save; select a result if there are multiple matches.')
   status.setAttribute('role', 'status')
   let token: string | undefined
-  let selectedAddress: string | undefined
+  let selectedQuery: string | undefined
   let sequence = 0
   let timer: ReturnType<typeof setTimeout>
   const choose = (candidate: AddressCandidate, query: string) => {
     clearTimeout(timer)
     ++sequence
-    selectedAddress = query
+    selectedQuery = query
     token = candidate.token
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
@@ -100,7 +100,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
     address.focus()
   }
   address.addEventListener('input', () => {
-    token = undefined; selectedAddress = undefined
+    token = undefined; selectedQuery = undefined
     candidates.replaceChildren()
     address.setAttribute('aria-expanded', 'false')
     clearTimeout(timer)
@@ -144,7 +144,7 @@ function propertyForm(property: Property | undefined, bins: Bin[], save: (body: 
       tags: [...new Set(tags.value.split(',').map(t => t.trim()).filter(Boolean))], attributes: attrs.value(),
     }
     if (property) body.version = property.version
-    if (token && selectedAddress === address.value) body.addressToken = token
+    if (token && selectedQuery === address.value) body.addressToken = token
     await save(body)
   })
   return form

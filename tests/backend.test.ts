@@ -7,7 +7,8 @@ import { convertV4MiniflareOptions, Miniflare } from 'miniflare'
 import { exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { enqueueManual, processJobs, scheduledWork } from '../worker/ai'
 import { addressSelection, searchAddress } from '../worker/address'
-import worker, { type Env } from '../worker/index'
+import worker from '../worker/index'
+import type { Env } from '../worker/index'
 import type { AddressCandidate, AIJob, Bin, Detail, Layer, Notification, Property, PropertyArea, Reminder, SavedView, User } from '../shared/types'
 
 let mf: Miniflare, db: D1Database, env: Env
@@ -402,7 +403,10 @@ test('Census cache reuses conservatively normalized queries and canonical single
   const selected = await createProperty('Normalized cache hit', { enteredAddress: query, addressToken: cached.data.candidates[0].token })
   assert.equal(selected.enteredAddress, query)
   assert.equal(selected.verificationStatus, 'verified')
-  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, name: 'Unrelated edit preserves selected whitespace query' })
+  const selectedAgain = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selected.version, enteredAddress: query, addressToken: cached.data.candidates[0].token })
+  assert.equal(selectedAgain.status, 200)
+  assert.equal(selectedAgain.data.enteredAddress, query)
+  const edited = await api<Property>(`properties/${selected.id}`, 'PATCH', { version: selectedAgain.data.version, name: 'Unrelated edit preserves selected whitespace query' })
   assert.equal(edited.status, 200)
   assert.equal(edited.data.enteredAddress, query)
   assert.equal(edited.data.verificationStatus, 'verified')
@@ -430,6 +434,66 @@ test('Census cache reuses conservatively normalized queries and canonical single
     assert.equal(censusCalls.at(-1), distinct)
   }
   assert.equal(censusCalls.length, afterSingle + 4)
+})
+
+test('stale concurrent reminder state changes return a conflict without overwriting the winner', async () => {
+  const localEnv = { ...env, DEV_AUTH: 'true', ACCESS_TEAM_DOMAIN: undefined, ACCESS_AUD: undefined }
+  const localApi = async <T>(path: string, method = 'GET', value?: unknown, database: D1Database = db) => {
+    const res = await worker.fetch(new Request(`http://127.0.0.1/api/${path}`, {
+      method,
+      headers: method === 'GET' ? {} : { 'Content-Type': 'application/json', Origin: 'http://127.0.0.1' },
+      ...(value === undefined ? {} : { body: JSON.stringify(value) }),
+    }), { ...localEnv, DB: database }, {} as ExecutionContext)
+    return { status: res.status, data: await res.json() as T }
+  }
+  const localBin = (await localApi<Bin[]>('bins')).data[0]
+  const p = (await localApi<Property>('properties', 'POST', {
+    name: 'Concurrent reminder edits', enteredAddress: '123 Main', binId: localBin.id, tags: ['lead'], attributes: { price: 100, active: true },
+  })).data
+  const reminder = await localApi<Reminder>(`properties/${p.id}/reminders`, 'POST', {
+    title: 'Original title', dueAt: '2030-01-01T10:00:00Z', timeZone: 'UTC',
+  })
+  assert.equal(reminder.status, 201)
+  let releaseInitialReads!: () => void
+  let releaseStaleUpdate!: () => void
+  let initialReadCount = 0
+  const initialReads = new Promise<void>(resolve => { releaseInitialReads = resolve })
+  const winningUpdate = new Promise<void>(resolve => { releaseStaleUpdate = resolve })
+  const readReminder = 'SELECT * FROM reminders WHERE id=? AND property_id=?'
+  const controlledDB = new Proxy(db, {
+    get(target, property) {
+      if (property !== 'prepare') return Reflect.get(target, property, target)
+      return (query: string) => {
+        const wrap = (statement: D1PreparedStatement, values: unknown[] = []): D1PreparedStatement => new Proxy(statement, {
+          get(targetStatement, member) {
+            if (member === 'bind') return (...boundValues: Parameters<D1PreparedStatement['bind']>) => wrap(targetStatement.bind(...boundValues), boundValues)
+            if (query === readReminder && member === 'first') return async (...args: never[]) => {
+              const result = await targetStatement.first(...args)
+              if (++initialReadCount === 2) releaseInitialReads()
+              await initialReads
+              return result
+            }
+            if (query.startsWith('UPDATE reminders SET') && member === 'first') return async (...args: never[]) => {
+              if (values[0] === 'cancelled') await winningUpdate
+              const result = await targetStatement.first(...args)
+              if (values[0] === 'completed') releaseStaleUpdate()
+              return result
+            }
+            const result = Reflect.get(targetStatement, member, targetStatement)
+            return typeof result === 'function' ? result.bind(targetStatement) : result
+          },
+        })
+        return wrap(target.prepare(query))
+      }
+    },
+  }) as D1Database
+  const patches = await Promise.all([
+    localApi<Reminder>(`properties/${p.id}/reminders/${reminder.data.id}`, 'PATCH', { state: 'completed' }, controlledDB),
+    localApi<Reminder>(`properties/${p.id}/reminders/${reminder.data.id}`, 'PATCH', { state: 'cancelled' }, controlledDB),
+  ])
+  assert.deepEqual(patches.map(result => result.status).sort(), [200, 409])
+  const result = await localApi<Detail>(`properties/${p.id}`)
+  assert.equal(result.data.reminders.find(item => item.id === reminder.data.id)!.state, 'completed')
 })
 
 test('Census no/invalid matches and provider failures never become successful cache entries; drafts remain available', async () => {
