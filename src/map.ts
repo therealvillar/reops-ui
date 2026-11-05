@@ -75,7 +75,7 @@ export class PropertyMap {
     return points.length
   }
 
-  private draw(): void {
+  private draw(focusPropertyId?: string): void {
     this.references.clearLayers()
     this.propertiesLayer.clearLayers()
     this.selection.clearLayers()
@@ -94,7 +94,8 @@ export class PropertyMap {
         points.reduce((n, p) => n + p.latitude, 0) / points.length,
         points.reduce((n, p) => n + p.longitude, 0) / points.length,
       ]
-      const selected = points.length === 1 && this.selectedId !== undefined && point.propertyId === this.selectedId
+      const groupContainsSelected = this.selectedId !== undefined && points.some(p => p.propertyId === this.selectedId)
+      const selected = points.length === 1 && groupContainsSelected
       const symbol = el('span', `map-pin${points.length > 1 ? ' cluster' : ''}${selected ? ' selected' : ''}`,
         points.length > 1 ? String(points.length) : point.propertyId ? '⌂' : '•')
       symbol.style.setProperty('--pin-color', points.some(p => p.color !== point.color) ? '#172b36' : point.color)
@@ -120,14 +121,18 @@ export class PropertyMap {
       else marker.bindPopup(el('div', '', point.label))
       marker.bindTooltip(el('span', '', points.length > 1 ? `${points.length} locations` : point.label))
       marker.addTo(selected ? this.selection : point.propertyId ? this.propertiesLayer : this.references)
-      marker.getElement()?.setAttribute('aria-label', points.length > 1 ? `${points.length} nearby locations — select to explore` : point.label)
-      if (point.propertyId && points.length === 1) marker.getElement()?.setAttribute('data-property-id', point.propertyId)
+      const element = marker.getElement()
+      element?.setAttribute('aria-label', points.length > 1 ? `${points.length} nearby locations — select to explore` : point.label)
+      const returnFocusId = points.length === 1 ? point.propertyId : groupContainsSelected ? this.selectedId : undefined
+      if (returnFocusId) element?.setAttribute('data-property-id', returnFocusId)
+      if (focusPropertyId && focusPropertyId === returnFocusId) element?.focus()
     }
   }
 
   private select(id: string): void {
+    const focusedInMap = this.map.getContainer().contains(document.activeElement)
     this.selectedId = id
-    this.draw()
+    this.draw(focusedInMap ? id : undefined)
     this.openDetail(id)
   }
 
