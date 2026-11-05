@@ -94,7 +94,7 @@ export class PropertyMap {
         points.reduce((n, p) => n + p.latitude, 0) / points.length,
         points.reduce((n, p) => n + p.longitude, 0) / points.length,
       ]
-      const selected = points.length === 1 && point.propertyId === this.selectedId
+      const selected = points.length === 1 && this.selectedId !== undefined && point.propertyId === this.selectedId
       const symbol = el('span', `map-pin${points.length > 1 ? ' cluster' : ''}${selected ? ' selected' : ''}`,
         points.length > 1 ? String(points.length) : point.propertyId ? '⌂' : '•')
       symbol.style.setProperty('--pin-color', points.some(p => p.color !== point.color) ? '#172b36' : point.color)
