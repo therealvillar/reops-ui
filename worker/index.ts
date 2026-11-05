@@ -187,16 +187,16 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           assert(old, 'Reminder not found', 404)
           const b = await body(request); keys(b, ['title', 'dueAt', 'timeZone', 'state'])
           assert(Object.keys(b).length > 0, 'Include at least one reminder field')
-          const title = b.title !== undefined ? text(b.title, 'reminder title', 500) : old.title
-          const dueAtValue = b.dueAt !== undefined ? dueAt(b.dueAt) : old.due_at
-          const timeZoneValue = b.timeZone !== undefined ? timeZone(b.timeZone) : old.time_zone
+          const title = b.title !== undefined ? text(b.title, 'reminder title', 500) : null
+          const dueAtValue = b.dueAt !== undefined ? dueAt(b.dueAt) : null
+          const timeZoneValue = b.timeZone !== undefined ? timeZone(b.timeZone) : null
           let nextState: Reminder['state'] | undefined
           if (b.state !== undefined) {
             assert(['completed', 'cancelled', 'scheduled'].includes(b.state as string), 'Only scheduled, completed, or cancelled can be selected; delivery is server-controlled')
             nextState = b.state as Reminder['state']
           }
-          const updated = await env.DB.prepare("UPDATE reminders SET title=?,due_at=?,time_zone=?,state=CASE WHEN ? IS NULL THEN state WHEN state='delivered' AND ?='scheduled' THEN state ELSE ? END,error=NULL,updated_by=? WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))) AND (? != 'scheduled' OR (state != 'delivered' AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.reminder_id=reminders.id))) RETURNING *")
-            .bind(title, dueAtValue, timeZoneValue, nextState ?? null, nextState ?? null, nextState ?? null, user.id, subId, id, user.id, user.id, nextState ?? '').first<ReminderRow>()
+          const updated = await env.DB.prepare("UPDATE reminders SET title=CASE WHEN ? IS NULL THEN title ELSE ? END,due_at=CASE WHEN ? IS NULL THEN due_at ELSE ? END,time_zone=CASE WHEN ? IS NULL THEN time_zone ELSE ? END,state=CASE WHEN ? IS NULL THEN state WHEN state='delivered' AND ?='scheduled' THEN state ELSE ? END,error=NULL,updated_by=? WHERE id=? AND property_id=? AND EXISTS(SELECT 1 FROM properties p WHERE p.id=reminders.property_id AND (p.owner_id=? OR EXISTS(SELECT 1 FROM property_members m WHERE m.property_id=p.id AND m.user_id=? AND m.role='editor'))) AND (? != 'scheduled' OR (state != 'delivered' AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.reminder_id=reminders.id))) RETURNING *")
+            .bind(title, title, dueAtValue, dueAtValue, timeZoneValue, timeZoneValue, nextState ?? null, nextState ?? null, nextState ?? null, user.id, subId, id, user.id, user.id, nextState ?? '').first<ReminderRow>()
           if (!updated) {
             const canEdit = await env.DB.prepare('SELECT p.id FROM properties p LEFT JOIN property_members m ON m.property_id=p.id AND m.user_id=? WHERE p.id=? AND (p.owner_id=? OR m.role=\'editor\')')
               .bind(user.id, id, user.id).first()
