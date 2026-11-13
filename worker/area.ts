@@ -2,8 +2,28 @@ import type { AreaCounty, AreaSource, Property, PropertyArea } from '../shared/t
 import { assert } from './validation'
 
 const radiusMeters = 500
+const philadelphiaRadiusMeters = 402.336
 const limit = 25
 const carto = 'https://phl.carto.com/api/v2/sql'
+const philadelphiaSources = [
+  { table: 'opa_properties_public', name: 'Philadelphia property assessments', dateField: 'recording_date', dateMeaning: 'Most recent recording date (event-date proxy, not property creation)' },
+  { table: 'rtt_summary', name: 'Philadelphia realty transfers', dateField: 'recording_date', dateMeaning: 'Transfer recording date' },
+  { table: 'permits', name: 'Philadelphia permits', dateField: 'permitissuedate', dateMeaning: 'Permit issue date' },
+  { table: 'violations', name: 'Philadelphia violations', dateField: 'casecreateddate', dateMeaning: 'Case creation date' },
+  { table: 'clean_seal', name: 'Philadelphia board-ups', dateField: 'casecreateddate', dateMeaning: 'Case creation date' },
+  { table: 'business_licenses', name: 'Philadelphia business licenses', dateField: 'initialissuedate', dateMeaning: 'Initial issue date' },
+  { table: 'demolitions', name: 'Philadelphia demolitions', dateField: 'start_date', dateMeaning: 'Demolition start date (event-date proxy)' },
+] as const
+
+export function twoYearsBefore(now: Date): string {
+  const date = new Date(now)
+  const day = date.getUTCDate()
+  date.setUTCDate(1)
+  date.setUTCFullYear(date.getUTCFullYear() - 2)
+  const lastDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate()
+  date.setUTCDate(Math.min(day, lastDay))
+  return date.toISOString()
+}
 export interface AreaOptions {
   BUCKS_PARCELS_ENABLED?: string
   DELAWARE_ZONING_ENABLED?: string
@@ -96,19 +116,17 @@ export async function propertyArea(property: Property, county: string | null, op
   assert(property.verificationStatus === 'verified' && typeof property.latitude === 'number' && Number.isFinite(property.latitude) && Math.abs(property.latitude) <= 90 &&
     typeof property.longitude === 'number' && Number.isFinite(property.longitude) && Math.abs(property.longitude) <= 180, 'Select a geocoded address before loading nearby data')
   const selected = county as AreaCounty
+  const fetchedAt = new Date().toISOString()
+  const cutoff = selected === 'philadelphia' ? twoYearsBefore(new Date(fetchedAt)) : null
   const sources: AreaSource[] = references[selected].map(source => ({
     ...source, status: 'reference', message: 'Reference website only; not an automated or property-matched feed.', records: [], limited: false,
   }))
   const queries: Promise<AreaSource>[] = []
   if (selected === 'philadelphia') {
-    for (const [table, name] of [
-      ['opa_properties_public', 'Philadelphia property assessments'], ['rtt_summary', 'Philadelphia realty transfers'],
-      ['permits', 'Philadelphia permits'], ['violations', 'Philadelphia violations'], ['clean_seal', 'Philadelphia board-ups'],
-      ['business_licenses', 'Philadelphia business licenses'], ['demolitions', 'Philadelphia demolitions'],
-    ]) {
+    for (const { table, name, dateField, dateMeaning } of philadelphiaSources) {
       const query = new URL(carto)
-      query.searchParams.set('q', `SELECT * FROM ${table} WHERE ST_DWithin(the_geom::geography, ST_SetSRID(ST_MakePoint(${property.longitude}, ${property.latitude}), 4326)::geography, ${radiusMeters}) ORDER BY ST_Distance(the_geom::geography, ST_SetSRID(ST_MakePoint(${property.longitude}, ${property.latitude}), 4326)::geography) LIMIT ${limit}`)
-      queries.push(loadSource(name!, `https://cityofphiladelphia.github.io/carto-api-explorer/#${table}`, query))
+      query.searchParams.set('q', `SELECT * FROM ${table} WHERE ${dateField} >= '${cutoff}' AND ${dateField} <= '${fetchedAt}' AND ST_DWithin(the_geom::geography, ST_SetSRID(ST_MakePoint(${property.longitude}, ${property.latitude}), 4326)::geography, ${philadelphiaRadiusMeters}) ORDER BY ST_Distance(the_geom::geography, ST_SetSRID(ST_MakePoint(${property.longitude}, ${property.latitude}), 4326)::geography) LIMIT ${limit}`)
+      queries.push(loadSource(name, `https://cityofphiladelphia.github.io/carto-api-explorer/#${table}`, query).then(source => ({ ...source, dateField, dateMeaning })))
     }
   } else {
     const source = countyGIS[selected]
@@ -128,5 +146,23 @@ export async function propertyArea(property: Property, county: string | null, op
     }
   }
   sources.push({ name: 'Berks sheriff auctions (outside the four-county area)', url: 'https://www.bid4assets.com/berkscountysheriffsales', status: 'reference', message: 'Supplemental user-provided reference only; not a nearby or property-matched feed.', records: [], limited: false })
-  return { county: selected, radiusMeters, fetchedAt: new Date().toISOString(), sources: [...await Promise.all(queries), ...sources] }
+  return { county: selected, radiusMeters: selected === 'philadelphia' ? philadelphiaRadiusMeters : radiusMeters, fetchedAt, cutoff, sources: [...await Promise.all(queries), ...sources] }
+}
+
+export async function recordArea(db: D1Database, property: Property, userId: string, area: PropertyArea): Promise<void> {
+  const id = crypto.randomUUID()
+  const statements = [db.prepare('INSERT INTO area_searches(id,property_id,user_id,county,latitude,longitude,radius_meters,cutoff,fetched_at) VALUES(?,?,?,?,?,?,?,?,?)')
+    .bind(id, property.id, userId, area.county, property.latitude, property.longitude, area.radiusMeters, area.cutoff, area.fetchedAt)]
+  for (const [index, source] of area.sources.entries()) {
+    statements.push(db.prepare('INSERT INTO area_search_sources(search_id,source_index,name,url,status,message,limited,date_field,date_meaning) VALUES(?,?,?,?,?,?,?,?,?)')
+      .bind(id, index, source.name, source.url, source.status, source.message, Number(source.limited), source.dateField ?? null, source.dateMeaning ?? null))
+    for (const [position, record] of source.records.entries()) {
+      const data = JSON.stringify(record)
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data))
+      const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+      statements.push(db.prepare('INSERT OR IGNORE INTO area_record_content(hash,data) VALUES(?,?)').bind(hash, data))
+      statements.push(db.prepare('INSERT INTO area_search_records(search_id,source_index,position,content_hash) VALUES(?,?,?,?)').bind(id, index, position, hash))
+    }
+  }
+  await db.batch(statements)
 }

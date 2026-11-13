@@ -3,6 +3,21 @@ import { test } from 'node:test'
 import type { Layer, LayerFeature, Property, SavedView } from '../shared/types'
 import { attributeNamePattern, compareValues, defaultView, fieldLabels, fieldValue, filterLayerFeatures, filterProperties, isMappable, layerFilterExclusion, matchesAttribute, moveProperty, newPropertyAIRule, parseAttributes, propertyBinChoices, propertyLayerVisible, restoreSavedView, validateReminderInstant, verificationStatusLabel } from '../src/utils'
 import { propertyLabel } from '../shared/property'
+import { api } from '../src/dom'
+
+test('JSON POST request shape used for nearby searches supplies the required content type', async () => {
+  const original = globalThis.fetch
+  try {
+    globalThis.fetch = async (input, init) => {
+      assert.equal(input, '/api/properties/example/area?county=philadelphia')
+      assert.equal(init?.method, 'POST')
+      assert.deepEqual(init?.headers, { 'Content-Type': 'application/json' })
+      assert.equal(init?.body, '{}')
+      return Response.json({ ok: true })
+    }
+    assert.deepEqual(await api('/properties/example/area?county=philadelphia', 'POST', {}), { ok: true })
+  } finally { globalThis.fetch = original }
+})
 
 const property = (overrides: Partial<Property> = {}): Property => ({
   id: 'p1', name: 'Alpha', enteredAddress: '123 Main Street', normalizedAddress: null,

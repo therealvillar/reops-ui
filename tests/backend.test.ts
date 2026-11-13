@@ -26,6 +26,7 @@ const signingSecret = 'test-only-address-signing-secret-32-characters'
 const censusCalls: string[] = []
 let censusFailures = 0
 let cartoCalls = 0
+let areaFixture = false
 let opaCalls: string[] = []
 let opaMode: 'exact' | 'changed' | 'none' | 'ambiguous' | 'invalid' | 'unit' = 'exact'
 
@@ -94,7 +95,7 @@ async function upstream(request: Request): Promise<Response> {
     }
     assert.match(sql, /ST_DWithin.*LIMIT 25$/)
     cartoCalls++
-    return Response.json({ rows: [] })
+    return Response.json({ rows: areaFixture ? [{ id: 1, address: 'Example nearby' }] : [] })
   }
   if (url.hostname === 'ai.example.com') {
     assert.equal(request.headers.get('authorization'), ['Bearer', 'test-ai-key'].join(' '))
@@ -638,14 +639,16 @@ test('address selection rejects invalid coordinates and wrong token claims even 
 test('area lookup enforces property access and inputs and fetches public data in the production Worker runtime', async () => {
   const beforeCalls = cartoCalls
   const draft = await createProperty('Area lookup draft')
-  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
-  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`)).status, 400)
+  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`, 'POST', undefined, 'bob')).status, 404)
+  assert.equal((await api(`properties/${draft.id}/area?county=philadelphia`, 'POST')).status, 400)
   const search = await api<{ candidates: AddressCandidate[] }>('addresses/search', 'POST', { query: '123 Main' })
   const located = await createProperty('Area lookup selected Census match', { addressToken: search.data.candidates[0].token })
-  assert.equal((await api(`properties/${located.id}/area?county=philadelphia`, 'GET', undefined, 'bob')).status, 404)
-  assert.equal((await api(`properties/${located.id}/area?county=unsupported`)).status, 400)
+  assert.equal((await api(`properties/${located.id}/area?county=philadelphia`, 'POST', undefined, 'bob')).status, 404)
+  assert.equal((await api(`properties/${located.id}/area?county=unsupported`, 'POST')).status, 400)
+  assert.equal((await api(`properties/${located.id}/area?county=philadelphia`, 'POST', undefined, 'alice', { Origin: 'https://evil.example' })).status, 403)
+  assert.equal((await api(`properties/${located.id}/area?county=philadelphia`)).status, 404)
   assert.equal(cartoCalls, beforeCalls)
-  const area = await api<PropertyArea>(`properties/${located.id}/area?county=philadelphia`)
+  const area = await api<PropertyArea>(`properties/${located.id}/area?county=philadelphia`, 'POST')
   assert.equal(area.status, 200)
   assert.equal(area.data.county, 'philadelphia')
   assert.equal(cartoCalls, beforeCalls + 7)
@@ -655,6 +658,38 @@ test('area lookup enforces property access and inputs and fetches public data in
     assert.deepEqual(source.records, [])
     assert.equal(source.limited, false)
   }
+  const searchRow = await db.prepare('SELECT * FROM area_searches WHERE property_id=?').bind(located.id).first<{ id: string; user_id: string; latitude: number; longitude: number; radius_meters: number; cutoff: string; fetched_at: string }>()
+  assert.ok(searchRow)
+  assert.equal(searchRow.user_id, user.id)
+  assert.equal(searchRow.latitude, located.latitude)
+  assert.equal(searchRow.longitude, located.longitude)
+  assert.equal(searchRow.radius_meters, 402.336)
+  assert.equal(searchRow.cutoff, area.data.cutoff)
+  assert.equal(searchRow.fetched_at, area.data.fetchedAt)
+  const storedSources = await db.prepare('SELECT status, date_field FROM area_search_sources WHERE search_id=? ORDER BY source_index').bind(searchRow.id).all<{ status: string; date_field: string | null }>()
+  assert.equal(storedSources.results.length, area.data.sources.length)
+  assert.equal(storedSources.results[0].date_field, 'recording_date')
+  const bob = (await api<User>('me', 'GET', undefined, 'bob')).data
+  assert.equal((await api(`properties/${located.id}/members`, 'POST', { userId: bob.id, role: 'viewer' })).status, 201)
+  areaFixture = true
+  try {
+    const viewer = await api<PropertyArea>(`properties/${located.id}/area?county=philadelphia`, 'POST', undefined, 'bob')
+    assert.equal(viewer.status, 200)
+    const saved = await db.prepare('SELECT id,user_id FROM area_searches WHERE property_id=? AND user_id=?').bind(located.id, bob.id).first<{ id: string; user_id: string }>()
+    assert.ok(saved)
+    const rows = await db.prepare('SELECT c.data FROM area_search_records r JOIN area_record_content c ON c.hash=r.content_hash WHERE r.search_id=?').bind(saved.id).all<{ data: string }>()
+    assert.equal(rows.results.length, 7)
+    assert.deepEqual(JSON.parse(rows.results[0].data), { id: 1, address: 'Example nearby' })
+    assert.equal((await db.prepare('SELECT COUNT(*) AS count FROM area_record_content').first<{ count: number }>())?.count, 1)
+  } finally {
+    areaFixture = false
+    await api(`properties/${located.id}/members/${encodeURIComponent(bob.id)}`, 'DELETE')
+  }
+  const edited = await api<Property>(`properties/${located.id}`, 'PATCH', { version: located.version, enteredAddress: 'Single match' })
+  assert.equal(edited.status, 200)
+  assert.notEqual(edited.data.latitude, located.latitude)
+  const originalCenter = await db.prepare('SELECT latitude,longitude FROM area_searches WHERE id=?').bind(searchRow.id).first<{ latitude: number; longitude: number }>()
+  assert.deepEqual(originalCenter, { latitude: located.latitude, longitude: located.longitude })
 })
 
 test('safe owner-scoped layer configuration and saved preferences persist server-side', async () => {
