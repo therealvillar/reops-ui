@@ -317,7 +317,7 @@ export async function openProperty(id: string, context: DetailContext): Promise<
 
 function areaSection(property: Property): HTMLElement {
   const section = el('section', 'detail-section')
-  section.append(el('h3', '', 'Nearby public data'), el('p', 'muted', 'Read-only public records within 500 meters of the geocoded Census location. Choose the county containing the property. These records are not a title, flood-risk, zoning, or legal determination. Loading shares the location with the selected public data providers.'))
+  section.append(el('h3', '', 'Nearby public data'), el('p', 'muted', 'Choose the county containing the property. Philadelphia searches within 0.25 miles and the last two years; other counties use 500 meters. Loading shares the location with public providers and saves a search snapshot. Nearby records are not a title, flood-risk, zoning, or legal determination.'))
   const county = select('area-county', [
     { value: 'philadelphia', label: 'Philadelphia' }, { value: 'montgomery', label: 'Montgomery' },
     { value: 'bucks', label: 'Bucks' }, { value: 'delaware', label: 'Delaware' },
@@ -327,13 +327,14 @@ function areaSection(property: Property): HTMLElement {
   section.append(label('County for public data', county), button('Load nearby data', async () => {
     results.replaceChildren(el('p', 'muted', 'Loading public sources…'))
     try {
-      const area = await api<PropertyArea>(`/properties/${encodeURIComponent(property.id)}/area?county=${encodeURIComponent(county.value)}`)
-      results.replaceChildren(el('p', 'muted', `Retrieved ${dateText(area.fetchedAt)} · radius ${area.radiusMeters} m · at most 25 records per source`))
+      const area = await api<PropertyArea>(`/properties/${encodeURIComponent(property.id)}/area?county=${encodeURIComponent(county.value)}`, 'POST', {})
+      results.replaceChildren(el('p', 'muted', `Search time ${dateText(area.fetchedAt)} · radius ${area.radiusMeters} m${area.cutoff ? ` · dates from ${area.cutoff} through ${area.fetchedAt}` : ''} · at most 25 records per source`))
       for (const source of area.sources) {
         const card = el('article', 'progress-card stack')
         const link = el('a', '', source.name)
         link.href = source.url; link.target = '_blank'; link.rel = 'noopener noreferrer'
         card.append(link, el('p', source.status === 'unavailable' ? 'error-text' : 'muted', source.message))
+        if (source.dateField) card.append(el('p', 'muted', `Date filter: ${source.dateMeaning} (${source.dateField}).`))
         if (source.limited) card.append(el('p', 'muted', 'Result limit reached; additional records may exist.'))
         for (const record of source.records) {
           const item = el('details')

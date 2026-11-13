@@ -2,7 +2,7 @@ import type { AIRule, Bin, Detail, Layer, LayerFeature, Note, Property, Reminder
 import { propertyLabel } from '../shared/property'
 import { authenticate, protectOrigin } from './auth'
 import { addressSelection, backfillAddresses, geocodeAddress, savedAddress, searchAddress } from './address'
-import { propertyArea } from './area'
+import { propertyArea, recordArea } from './area'
 import { enqueueManual, jobModel, processJobs, requireAI, scheduledWork, type JobRow } from './ai'
 import { enqueueRefresh, enrichmentSources, jobInsert, processEnrichmentJobs, propertyEnrichment, scheduleEnrichment } from './enrichment'
 import { tileConfig } from './tile'
@@ -178,8 +178,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return response(p, 201)
     }
     if (id) {
-      const p = await accessibleProperty(env, user, id, !['GET', 'HEAD'].includes(method))
-      if (sub === 'area' && parts.length === 3 && method === 'GET') return response(await propertyArea(p, url.searchParams.get('county'), env))
+      const areaSearch = sub === 'area' && parts.length === 3 && method === 'POST'
+      const p = await accessibleProperty(env, user, id, !areaSearch && !['GET', 'HEAD'].includes(method))
+      if (areaSearch) {
+        const area = await propertyArea(p, url.searchParams.get('county'), env)
+        await recordArea(env.DB, p, user.id, area)
+        return response(area)
+      }
       if (sub === 'enrichment' && parts.length === 3 && method === 'POST') {
         const b = await body(request); keys(b, ['idempotencyKey'])
         return response(await enqueueRefresh(env, p, user.id, text(b.idempotencyKey, 'idempotencyKey', 100)), 202)

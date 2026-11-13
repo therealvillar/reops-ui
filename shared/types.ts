@@ -90,11 +90,14 @@ export interface AreaSource {
   message: string
   records: Record<string, string | number | boolean | null>[]
   limited: boolean
+  dateField?: string
+  dateMeaning?: string
 }
 export interface PropertyArea {
   county: AreaCounty
   radiusMeters: number
   fetchedAt: string
+  cutoff: string | null
   sources: AreaSource[]
 }
 export interface Layer {
